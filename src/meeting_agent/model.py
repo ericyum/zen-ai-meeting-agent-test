@@ -12,13 +12,33 @@ class MeetingModel(Protocol):
         authorized_ids: list[str],
     ) -> str: ...
 
-    def search_response(
-        self, request: str, selected: list[dict[str, Any]], mode: str
+    def interpret_candidate_count(
+        self,
+        request: str,
+        candidates: list[dict[str, Any]],
+        scratchpad: list[dict[str, Any]],
     ) -> str: ...
 
-    def answer_question(self, request: str, documents: list[dict[str, str]]) -> str: ...
+    def search_response(
+        self,
+        request: str,
+        selected: list[dict[str, Any]],
+        mode: str,
+        tool_result: dict[str, Any],
+    ) -> str: ...
 
-    def direct_response(self, request: str) -> str: ...
+    def answer_question(
+        self,
+        system_instruction: str,
+        request: str,
+        scratchpad: list[dict[str, Any]],
+        documents: list[dict[str, str]],
+        tool_result: dict[str, Any],
+    ) -> str: ...
+
+    def direct_response(
+        self, system_instruction: str, request: str, scratchpad: list[dict[str, Any]]
+    ) -> str: ...
 
 
 class RuleBasedMeetingModel:
@@ -57,9 +77,25 @@ class RuleBasedMeetingModel:
             return "direct"
         return "done"
 
-    def search_response(
-        self, request: str, selected: list[dict[str, Any]], mode: str
+    def interpret_candidate_count(
+        self,
+        request: str,
+        candidates: list[dict[str, Any]],
+        scratchpad: list[dict[str, Any]],
     ) -> str:
+        count = len(candidates)
+        return "none" if count == 0 else "one" if count == 1 else "many"
+
+    def search_response(
+        self,
+        request: str,
+        selected: list[dict[str, Any]],
+        mode: str,
+        tool_result: dict[str, Any],
+    ) -> str:
+        if tool_result.get("status") == "failed":
+            error = tool_result.get("error", {})
+            return f"회의록 검색을 완료하지 못했습니다: {error.get('message', '알 수 없는 오류')}"
         if not selected:
             return "접근 가능한 관련 회의록을 찾지 못했습니다. 기존 허용 ID는 유지합니다."
         ids = ", ".join(item["id"] for item in selected)
@@ -67,7 +103,19 @@ class RuleBasedMeetingModel:
         mode_text = {"set": "새 목록으로 설정", "add": "기존 목록에 추가", "replace": "새 목록으로 대체"}[mode]
         return f"회의록 {ids} ({titles})을 확인하여 {mode_text}했습니다."
 
-    def answer_question(self, request: str, documents: list[dict[str, str]]) -> str:
+    def answer_question(
+        self,
+        system_instruction: str,
+        request: str,
+        scratchpad: list[dict[str, Any]],
+        documents: list[dict[str, str]],
+        tool_result: dict[str, Any],
+    ) -> str:
+        status = tool_result.get("status")
+        if status == "selection_required":
+            return "질문에 사용할 회의록이 선택되지 않았습니다. 먼저 관련 회의록을 검색해 주세요."
+        if status == "source_denied_or_failed":
+            return f"회의록 원문을 조회하지 못했습니다: {tool_result.get('reason', '알 수 없는 오류')}"
         if not documents:
             return "질문에 사용할 회의록이 선택되지 않았습니다. 먼저 관련 회의록을 검색해 주세요."
         sections = []
@@ -76,6 +124,7 @@ class RuleBasedMeetingModel:
             sections.append(f"- {doc['title']} ({doc['id']}): {transcript}")
         return "선택된 회의록을 기준으로 확인한 내용입니다.\n" + "\n".join(sections)
 
-    def direct_response(self, request: str) -> str:
+    def direct_response(
+        self, system_instruction: str, request: str, scratchpad: list[dict[str, Any]]
+    ) -> str:
         return "이 요청은 회의록 Tool 없이 답변했습니다. 회의록 검색이나 내용 질문을 요청할 수 있습니다."
-

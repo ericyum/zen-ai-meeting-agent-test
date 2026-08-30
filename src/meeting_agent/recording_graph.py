@@ -23,6 +23,7 @@ def build_recording_workflow(repository: MeetingRepository):
                 "response": result.message,
             }
         except Exception as exc:  # POC boundary for modal/connection errors.
+            repository.set_modal_status(state["thread_id"], "error")
             return {
                 "previous_state": repository.get_recording_state(state["thread_id"]),
                 "current_state": repository.get_recording_state(state["thread_id"]),
@@ -34,4 +35,3 @@ def build_recording_workflow(repository: MeetingRepository):
     builder.add_edge(START, "recording_modal_and_backend")
     builder.add_edge("recording_modal_and_backend", END)
     return builder
-

@@ -35,7 +35,21 @@ class RecordingWorkflowTest(unittest.TestCase):
         self.assertEqual(rejected["recording_modal_status"], "healthy")
         self.assertIn("실행할 수 없습니다", rejected["response"])
 
+    def test_modal_execution_error_is_persisted_only_as_agent_status(self):
+        def fail_modal(user_id, thread_id, command):
+            raise ConnectionError("modal disconnected")
+
+        self.runtime.repository.execute_recording_command = fail_modal
+        result = self.runtime.run_recording("user-eric", "thread-error", "start")
+        self.assertEqual(result["recording_modal_status"], "error")
+        self.assertEqual(self.runtime.repository.get_modal_status("thread-error"), "error")
+        state = self.runtime.get_agent_state("thread-error")
+        self.assertEqual(
+            set(state), {"ScratchPad", "authorized_meeting_ids", "recording_modal_status"}
+        )
+        self.assertEqual(state["recording_modal_status"], "error")
+        self.assertNotIn("recording_state", state)
+
 
 if __name__ == "__main__":
     unittest.main()
-

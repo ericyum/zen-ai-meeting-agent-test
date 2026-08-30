@@ -281,7 +281,7 @@ class MeetingRepository:
             "INSERT INTO recording_events(thread_id, user_id, command, previous_state, current_state, ok, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
             (thread_id, user_id, command, previous, current, now),
         )
-        self._set_modal_status(thread_id, "healthy", now)
+        self.set_modal_status(thread_id, "healthy", now)
         self.conn.commit()
         transition = f"{previous} → {'stop → none' if command == 'stop' else current}"
         return RecordingResult(True, previous, current, "healthy", f"녹화 명령 성공: {transition}")
@@ -300,11 +300,14 @@ class MeetingRepository:
             (thread_id, user_id, command, previous, previous, now),
         )
         # A normal state/permission rejection is not a modal execution error.
-        self._set_modal_status(thread_id, "healthy", now)
+        self.set_modal_status(thread_id, "healthy", now)
         self.conn.commit()
         return RecordingResult(False, previous, previous, "healthy", message)
 
-    def _set_modal_status(self, thread_id: str, status: str, now: str) -> None:
+    def set_modal_status(
+        self, thread_id: str, status: str, now: str | None = None
+    ) -> None:
+        now = now or datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
             INSERT INTO thread_modal_status(thread_id, status, updated_at)
@@ -313,3 +316,4 @@ class MeetingRepository:
             """,
             (thread_id, status, now),
         )
+        self.conn.commit()

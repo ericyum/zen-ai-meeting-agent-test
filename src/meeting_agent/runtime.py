@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-import uuid
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,7 @@ from .agent_graph import build_agent_graph
 from .model import MeetingModel, RuleBasedMeetingModel
 from .recording_graph import build_recording_workflow
 from .repository import MeetingRepository
+from .state import AgentContext
 
 
 class MeetingAgentRuntime:
@@ -30,9 +31,12 @@ class MeetingAgentRuntime:
         self.agent_graph = build_agent_graph(self.repository, self.model).compile(
             checkpointer=self.checkpointer
         )
-        self.recording_graph = build_recording_workflow(self.repository).compile(
-            checkpointer=self.checkpointer
-        )
+        # recording_state belongs to the modal/backend repository, not to an
+        # Agent or recording-graph checkpoint.
+        self.recording_graph = build_recording_workflow(self.repository).compile()
+        self._locks_guard = threading.Lock()
+        self._thread_locks: dict[str, threading.RLock] = {}
+        self._pending_contexts: dict[str, AgentContext] = {}
 
     def close(self) -> None:
         self.repository.close()
@@ -54,38 +58,74 @@ class MeetingAgentRuntime:
     def seed(self) -> None:
         self.repository.seed_dummy_data()
 
+    def _lock_for(self, thread_id: str) -> threading.RLock:
+        with self._locks_guard:
+            return self._thread_locks.setdefault(thread_id, threading.RLock())
+
+    @staticmethod
+    def _response_from_state(state: dict[str, Any]) -> str:
+        for event in reversed(state.get("ScratchPad", [])):
+            if event.get("kind") == "user_request":
+                break
+            if "response" in event:
+                return str(event["response"])
+        return ""
+
+    def _result_view(self, state: dict[str, Any]) -> dict[str, Any]:
+        # response is an API convenience view and is not a persisted State field.
+        return {**state, "response": self._response_from_state(state)}
+
     def run_agent(
         self,
         user_id: str,
         thread_id: str,
         request: str,
-        request_id: str | None = None,
     ) -> dict[str, Any]:
-        config = self._config(thread_id, "meeting-agent")
-        snapshot = self.agent_graph.get_state(config)
-        payload: dict[str, Any] = {
-            "user_id": user_id,
-            "thread_id": thread_id,
-            "request_id": request_id or str(uuid.uuid4()),
-            "request": request,
-            "recording_modal_status": self.repository.get_modal_status(thread_id),
-        }
-        if not snapshot.values:
-            payload.update({"ScratchPad": [], "authorized_meeting_ids": []})
-        return self.agent_graph.invoke(payload, config)
+        with self._lock_for(thread_id):
+            config = self._config(thread_id, "meeting-agent")
+            snapshot = self.agent_graph.get_state(config)
+            payload: dict[str, Any] = {
+                "recording_modal_status": self.repository.get_modal_status(thread_id)
+            }
+            if not snapshot.values:
+                payload.update({"ScratchPad": [], "authorized_meeting_ids": []})
+            context = AgentContext(user_id=user_id, thread_id=thread_id, request=request)
+            self._pending_contexts[thread_id] = context
+            result = self.agent_graph.invoke(payload, config, context=context)
+            if not result.get("__interrupt__"):
+                self._pending_contexts.pop(thread_id, None)
+            return self._result_view(result)
 
     def resume_agent(self, thread_id: str, answer: Any) -> dict[str, Any]:
-        return self.agent_graph.invoke(
-            Command(resume=answer), self._config(thread_id, "meeting-agent")
-        )
+        with self._lock_for(thread_id):
+            context = self._pending_contexts.get(thread_id)
+            if context is None:
+                raise RuntimeError("현재 프로세스에 재개할 HITL 실행 컨텍스트가 없습니다.")
+            result = self.agent_graph.invoke(
+                Command(resume=answer),
+                self._config(thread_id, "meeting-agent"),
+                context=context,
+            )
+            if not result.get("__interrupt__"):
+                self._pending_contexts.pop(thread_id, None)
+            return self._result_view(result)
 
     def run_recording(
         self, user_id: str, thread_id: str, command: str
     ) -> dict[str, Any]:
-        return self.recording_graph.invoke(
-            {"user_id": user_id, "thread_id": thread_id, "command": command},
-            self._config(thread_id, "recording-workflow"),
-        )
+        with self._lock_for(thread_id):
+            result = self.recording_graph.invoke(
+                {"user_id": user_id, "thread_id": thread_id, "command": command}
+            )
+            config = self._config(thread_id, "meeting-agent")
+            snapshot = self.agent_graph.get_state(config)
+            update: dict[str, Any] = {
+                "recording_modal_status": result["recording_modal_status"]
+            }
+            if not snapshot.values:
+                update.update({"ScratchPad": [], "authorized_meeting_ids": []})
+            self.agent_graph.update_state(config, update)
+            return result
 
     def get_agent_state(self, thread_id: str) -> dict[str, Any]:
         snapshot = self.agent_graph.get_state(self._config(thread_id, "meeting-agent"))
@@ -105,6 +145,18 @@ class MeetingAgentRuntime:
                 }
             )
         return items
+
+    def list_agent_checkpoint_states(
+        self, thread_id: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return parent Agent State snapshots for persistence-focused tests."""
+
+        config = self._config(thread_id, "meeting-agent")
+        return [
+            dict(snapshot.values)
+            for index, snapshot in enumerate(self.agent_graph.get_state_history(config))
+            if index < limit
+        ]
 
 
 def interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
