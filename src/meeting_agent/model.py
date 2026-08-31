@@ -78,12 +78,12 @@ class RuleBasedMeetingModel:
         if needs_search and "search_response" not in kinds:
             return "search"
         if search_event is not None and not search_event.get("selected_ids"):
-            return "done"
+            return "none"
         if needs_question and "question_response" not in kinds:
             return "question"
         if not needs_search and not needs_question and "direct_response" not in kinds:
             return "direct"
-        return "done"
+        return "none"
 
     def interpret_candidate_count(
         self,
@@ -108,7 +108,12 @@ class RuleBasedMeetingModel:
             return "접근 가능한 관련 회의록을 찾지 못했습니다. 기존 허용 ID는 유지합니다."
         ids = ", ".join(item["id"] for item in selected)
         titles = ", ".join(item["title"] for item in selected)
-        mode_text = {"set": "새 목록으로 설정", "add": "기존 목록에 추가", "replace": "새 목록으로 대체"}[mode]
+        mode_text = {
+            "set": "새 목록으로 설정",
+            "add": "기존 목록에 추가",
+            "replace": "새 목록으로 대체",
+            "unchanged": "기존 허용 목록에서 다시 확인",
+        }[mode]
         return f"회의록 {ids} ({titles})을 확인하여 {mode_text}했습니다."
 
     def answer_question(
@@ -246,15 +251,15 @@ class DeepSeekMeetingModel:
     ) -> str:
         return self._enum(
             "action",
-            {"search", "question", "direct", "done"},
+            {"search", "question", "direct", "none"},
             (
                 "당신은 회의록 Agent의 목표 판단기다. 반드시 JSON 객체만 반환한다. "
-                "action은 search, question, direct, done 중 하나다. 회의록을 찾거나 선택해야 하면 search, "
+                "action은 search, question, direct, none 중 하나다. 회의록을 찾거나 선택해야 하면 search, "
                 "선택된 회의록 내용에 답해야 하면 question, Tool이 불필요한 일반 응답이면 direct, "
-                "현재 사용자 목표가 이미 완료됐으면 done이다. 완료된 작업을 반복하지 마라. "
+                "현재 사용자 목표가 이미 완료되어 입력 대기 State로 돌아가야 하면 none이다. 완료된 작업을 반복하지 마라. "
                 "판정 우선순위: (1) 요청이 검색·가져오기를 포함하고 search_response가 없으면 search, "
                 "(2) 요청이 내용·결정·요약·설명을 포함하고 question_response가 없으며 검색이 성공했거나 "
-                "authorized_meeting_ids가 있으면 question, (3) 필요한 응답 이벤트가 모두 있으면 done이다. "
+                "authorized_meeting_ids가 있으면 question, (3) 필요한 응답 이벤트가 모두 있으면 none이다. "
                 "검색과 질문이 결합된 요청은 search 뒤에 반드시 question을 수행해야 한다."
             ),
             self._json_text(
@@ -262,7 +267,7 @@ class DeepSeekMeetingModel:
                     "request": request,
                     "current_goal_events": request_events,
                     "authorized_meeting_ids": authorized_ids,
-                    "required_output": {"action": "search|question|direct|done"},
+                    "required_output": {"action": "search|question|direct|none"},
                 }
             ),
         )

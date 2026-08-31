@@ -32,7 +32,23 @@ class PresentationTraceTest(unittest.TestCase):
                 nodes = [event.get("node") for event in trace]
                 self.assertIn("S1_tool_1_search", nodes)
                 self.assertIn("Q1_tool_2_context_and_answer", nodes)
+                decisions = [
+                    event.get("decision")
+                    for event in trace
+                    if event.get("node") == "llm_goal_condition"
+                    and event.get("phase") == "end"
+                ]
+                self.assertIn("search", decisions)
+                self.assertIn("none", decisions)
+                self.assertNotIn("done", decisions)
                 self.assertNotIn("transcript", str(trace).lower())
+                self.assertTrue(any(event.get("type") == "state" for event in trace))
+                self.assertTrue(
+                    any(
+                        event.get("node") == "graph_runtime_checkpoint"
+                        for event in trace
+                    )
+                )
             finally:
                 runtime.close()
 

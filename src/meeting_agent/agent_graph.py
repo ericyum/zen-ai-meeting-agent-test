@@ -129,10 +129,20 @@ def build_search_subgraph(repository: MeetingRepository, model: MeetingModel):
     def existing_route(state: SearchState) -> str:
         if not state.get("selected_ids"):
             return "none"
-        return "existing" if state.get("authorized_meeting_ids") else "new"
+        existing_ids = set(state.get("authorized_meeting_ids", []))
+        if not existing_ids:
+            return "new"
+        if set(state["selected_ids"]).issubset(existing_ids):
+            return "unchanged"
+        return "existing"
 
     def set_new_ids(state: SearchState) -> dict[str, Any]:
         return {"authorized_meeting_ids": state["selected_ids"], "merge_mode": "set"}
+
+    def keep_existing_ids(state: SearchState) -> dict[str, Any]:
+        """A repeated search for an already-authorized ID needs no HITL."""
+
+        return {"merge_mode": "unchanged"}
 
     def hitl_merge(state: SearchState) -> dict[str, Any]:
         answer = interrupt(
@@ -188,6 +198,7 @@ def build_search_subgraph(repository: MeetingRepository, model: MeetingModel):
     builder.add_node("S2C_hitl_select", hitl_select)
     builder.add_node("S2_tool_failed", tool_failed)
     builder.add_node("S2_set_new_ids", set_new_ids)
+    builder.add_node("S2_keep_existing_ids", keep_existing_ids)
     builder.add_node("S2_hitl_add_or_replace", hitl_merge)
     builder.add_node("S3_search_response_ready", search_response)
     builder.add_edge(START, "S1_tool_1_search")
@@ -206,14 +217,15 @@ def build_search_subgraph(repository: MeetingRepository, model: MeetingModel):
     builder.add_conditional_edges(
         "S2B_auto_select",
         existing_route,
-        {"none": "S3_search_response_ready", "new": "S2_set_new_ids", "existing": "S2_hitl_add_or_replace"},
+        {"none": "S3_search_response_ready", "new": "S2_set_new_ids", "unchanged": "S2_keep_existing_ids", "existing": "S2_hitl_add_or_replace"},
     )
     builder.add_conditional_edges(
         "S2C_hitl_select",
         existing_route,
-        {"none": "S3_search_response_ready", "new": "S2_set_new_ids", "existing": "S2_hitl_add_or_replace"},
+        {"none": "S3_search_response_ready", "new": "S2_set_new_ids", "unchanged": "S2_keep_existing_ids", "existing": "S2_hitl_add_or_replace"},
     )
     builder.add_edge("S2_set_new_ids", "S3_search_response_ready")
+    builder.add_edge("S2_keep_existing_ids", "S3_search_response_ready")
     builder.add_edge("S2_hitl_add_or_replace", "S3_search_response_ready")
     builder.add_edge("S3_search_response_ready", END)
     return builder.compile()
@@ -337,7 +349,7 @@ def build_agent_graph(repository: MeetingRepository, model: MeetingModel):
             "search": "search_subgraph",
             "question": "question_subgraph",
             "direct": "llm_direct_answer",
-            "done": "request_finished",
+            "none": "request_finished",
         }
         return Command(
             goto=destinations[action],

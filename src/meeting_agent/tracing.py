@@ -78,6 +78,11 @@ def debug_stream_to_trace(
             if node == "__start__":
                 continue
             result = payload.get("result")
+            decision = None
+            if node == "llm_goal_condition" and isinstance(result, dict):
+                for item in result.get("ScratchPad", []):
+                    if item.get("kind") == "llm_decision":
+                        decision = item.get("action")
             trace.append(
                 {
                     "type": "node",
@@ -86,6 +91,7 @@ def debug_stream_to_trace(
                     "node": node,
                     "step": event.get("step"),
                     "output": safe_state(result) if isinstance(result, dict) else safe_value(result),
+                    "decision": decision,
                     "error": safe_value(payload.get("error")),
                     "interrupts": safe_value(payload.get("interrupts", [])),
                 }

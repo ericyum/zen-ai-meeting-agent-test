@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypedDict
 
 
-Action = Literal["search", "question", "direct", "done"]
+Action = Literal["search", "question", "direct", "none"]
 RecordingModalStatus = Literal["healthy", "error"]
 RecordingCommand = Literal["start", "pause", "resume", "stop"]
 
@@ -45,7 +45,7 @@ class SearchState(AgentState, total=False):
 
     candidates: list[dict[str, Any]]
     selected_ids: list[str]
-    merge_mode: Literal["set", "add", "replace", ""]
+    merge_mode: Literal["set", "add", "replace", "unchanged", ""]
     tool_status: Literal["ok", "failed"]
     tool_error: dict[str, Any]
 

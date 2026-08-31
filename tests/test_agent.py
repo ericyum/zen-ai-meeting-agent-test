@@ -104,6 +104,20 @@ class AgentGraphTest(unittest.TestCase):
         self.assertIsNone(interrupt_payload(resumed))
         self.assertEqual(resumed["authorized_meeting_ids"], ["meeting-002"])
 
+    def test_repeated_search_for_same_authorized_id_needs_no_merge_hitl(self):
+        first = self.runtime.run_agent(
+            "user-eric", "thread-repeat", "meeting-001 회의록을 찾아줘"
+        )
+        self.assertIsNone(interrupt_payload(first))
+        second = self.runtime.run_agent(
+            "user-eric",
+            "thread-repeat",
+            "meeting-001 회의록을 가져오고 결정 사항을 설명해줘",
+        )
+        self.assertIsNone(interrupt_payload(second))
+        self.assertEqual(second["authorized_meeting_ids"], ["meeting-001"])
+        self.assertIn("결정 사항", second["response"])
+
     def test_backend_filters_unauthorized_explicit_id(self):
         result = self.runtime.run_agent(
             "user-eric", "thread-denied", "meeting-004 회의록을 가져와줘"
