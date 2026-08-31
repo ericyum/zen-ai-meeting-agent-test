@@ -5,11 +5,21 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .model import DEFAULT_DEEPSEEK_MODEL, DeepSeekMeetingModel, RuleBasedMeetingModel
 from .runtime import MeetingAgentRuntime, interrupt_payload
 
 
+DEFAULT_DEEPSEEK_KEY_FILE = (
+    r"C:\Users\염정운\OneDrive - (주)젠컨설팅\바탕 화면\API Key 및 Key 값\DeepSeek API Key.txt"
+)
+
+
 def _runtime(args: argparse.Namespace) -> MeetingAgentRuntime:
-    return MeetingAgentRuntime(args.app_db, args.checkpoint_db)
+    if args.model_provider == "deepseek":
+        model = DeepSeekMeetingModel.from_key_file(args.deepseek_key_file, args.deepseek_model)
+    else:
+        model = RuleBasedMeetingModel()
+    return MeetingAgentRuntime(args.app_db, args.checkpoint_db, model=model)
 
 
 def _resume_value(payload: dict[str, Any]) -> Any:
@@ -89,6 +99,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ZEN AI meeting-agent LangGraph POC")
     parser.add_argument("--app-db", default="data/app.db")
     parser.add_argument("--checkpoint-db", default="data/checkpoints.db")
+    parser.add_argument(
+        "--model-provider",
+        choices=["deepseek", "rule-based"],
+        default="deepseek",
+        help="기본값은 실제 DeepSeek API이며 rule-based는 오프라인 테스트 대역입니다.",
+    )
+    parser.add_argument("--deepseek-model", default=DEFAULT_DEEPSEEK_MODEL)
+    parser.add_argument("--deepseek-key-file", default=DEFAULT_DEEPSEEK_KEY_FILE)
     sub = parser.add_subparsers(required=True)
 
     seed = sub.add_parser("seed", help="SQLite 더미 데이터 생성")

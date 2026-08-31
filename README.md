@@ -1,25 +1,28 @@
 # ZEN AI Meeting Agent LangGraph POC
 
-`1-1. 회의록 에이전트 업무 개요`와 `1-2. 회의록 에이전트 워크플로우 Graph 상세`를 실행 가능한 코드로 옮긴 로컬 POC입니다.
+회의록 Agent 설계가 기술적으로 성립하는지를 독립적으로 검증하기 위해 Python과 LangGraph로 작성한 POC입니다. 향후 `zen-ai`에 이식할 때 참고하지만, 현재 POC의 구조를 실제 서비스 구조에 억지로 맞추는 것이 목적은 아닙니다.
 
-## 구현 범위
+## POC의 핵심 질문
+
+> **회의록 Agent 설계가 기술적으로 성립하는가?**
+
+이를 위해 다음을 실행 가능한 코드와 테스트로 확인합니다.
 
 - LangGraph `StateGraph` 기반 최상위 Agent Graph
 - Search·Question 내부 Subgraph
 - SQLite `SqliteSaver` 기반 Agent Checkpoint
-- SQLite 더미 사용자·회의록·권한·녹화 모달 데이터
-- 복수 검색 후보와 기존 ID 추가·대체를 위한 `interrupt()` HITL
+- 복수 후보와 기존 ID 추가·대체를 위한 `interrupt()` HITL
 - `ScratchPad`, `authorized_meeting_ids`, `recording_modal_status`
-- Checkpoint 뒤 후속 작업 판단을 통한 Search → Question 제어 루프
+- Search 완료 후 Question으로 이어지는 제어 Loop
 - LLM을 사용하지 않는 독립된 결정적 녹화 Workflow
-- 회의록 원문을 Agent State·Checkpoint에 저장하지 않는 컨텍스트 조립
-- 영속 Agent State를 `ScratchPad`, `authorized_meeting_ids`, `recording_modal_status`로 제한
-- 사용자·스레드·요청을 비영속 LangGraph Runtime Context로 전달
-- 같은 스레드 요청의 프로세스 내 순차 처리
+- 회의록 원문을 Agent State·Checkpoint에 저장하지 않는 Context 조립
+- 사용자·스레드·요청을 비영속 Runtime Context로 전달
+- 같은 Thread 요청의 프로세스 내 순차 처리
 - Tool 실패 2회 재시도와 구조화 오류 반환
-- 컨텍스트 예산의 50%에서 `ScratchPad` Compact
+- Context 예산 50%에서 `ScratchPad` Compact
+- 실제 `deepseek-v4-pro` 모델 호출
 
-기본 모델은 API 키 없이 실행되는 `RuleBasedMeetingModel`입니다. LLM이 담당하는 의도·후속 작업 판단과 답변 생성을 재현하기 위한 더미 구현이며, Graph와 Tool 경계는 실제 모델 어댑터로 교체할 수 있게 분리했습니다.
+CLI의 기본 모델은 실제 DeepSeek API를 호출하는 `DeepSeekMeetingModel`입니다. `RuleBasedMeetingModel`은 빠르고 재현 가능한 오프라인 테스트 대역으로 유지합니다. API 키는 코드나 State에 저장하지 않고 실행 시 키 파일에서만 읽습니다.
 
 ## 설계 대응
 
@@ -39,15 +42,23 @@
    └─ 후속 작업 없음: END
 ```
 
-`search`와 `question`은 별도 지속 코드 변수로 저장하지 않습니다. 실행 중인 Subgraph Node와 Edge가 해당 개념적 Graph State를 나타냅니다.
+`search`와 `question`은 별도 영속 변수로 저장하지 않습니다. 실행 중인 Subgraph Node와 Edge가 개념적 Graph State를 나타냅니다.
 
-`user_id`, `thread_id`, 현재 `request`는 `AgentContext`로 전달되며 Agent Checkpoint에 저장되지 않습니다. 별도 `run_id`나 `request_id`도 사용하지 않습니다.
+`user_id`, `thread_id`, 현재 `request`는 `AgentContext`로 전달되며 Checkpoint에 저장되지 않습니다. 회의록 원문도 Question Node의 지역 변수에만 존재하며 State에는 답변과 문서 메타데이터만 남습니다.
 
-회의록 원문은 `Q2B_Q2C_tool_2_and_answer` Node의 지역 변수에만 존재합니다. State로 반환하는 값은 답변과 문서 ID·제목 메타데이터뿐이므로 SQLite Checkpoint에는 원문이 들어가지 않습니다.
+## 파일별 역할
+
+| 파일 | 역할 |
+|---|---|
+| `src/meeting_agent/state.py` | Agent State, Subgraph State, Runtime Context |
+| `src/meeting_agent/agent_graph.py` | 최상위 Agent Graph와 Search·Question Subgraph |
+| `src/meeting_agent/recording_graph.py` | LLM 없는 결정적 녹화 Workflow |
+| `src/meeting_agent/runtime.py` | Graph 조립, Checkpoint, Lock, HITL 재개 |
+| `src/meeting_agent/model.py` | 실제 DeepSeek Adapter와 테스트 Model 계약 |
+| `src/meeting_agent/repository.py` | 권한·검색·원문·녹화 백엔드의 SQLite 대역 |
+| `src/meeting_agent/cli.py` | 실제 UI 대신 사용하는 로컬 실행 진입점 |
 
 ## 설치
-
-Windows PowerShell 기준:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -56,80 +67,72 @@ py -3.11 -m venv .venv
 
 ## 실행
 
-더미 데이터 생성:
+실제 DeepSeek으로 Search → Question 복합 요청을 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m meeting_agent `
+  --deepseek-key-file "C:\secure\DeepSeek API Key.txt" `
+  ask "meeting-001 회의록을 가져오고 결정 사항을 설명해줘"
+```
+
+외부 API 없이 규칙 기반 대역으로 실행하려면:
+
+```powershell
+.\.venv\Scripts\python.exe -m meeting_agent `
+  --model-provider rule-based `
+  ask "meeting-001 회의록을 가져오고 결정 사항을 설명해줘"
+```
+
+기타 명령:
 
 ```powershell
 .\.venv\Scripts\meeting-agent.exe seed
-```
-
-Search → Question 복합 요청:
-
-```powershell
-.\.venv\Scripts\meeting-agent.exe ask "meeting-001 회의록을 가져오고 결정 사항을 설명해줘"
-```
-
-복수 후보 HITL을 확인하려면:
-
-```powershell
-.\.venv\Scripts\meeting-agent.exe ask "회의록 검색해줘"
-```
-
-대화형 실행:
-
-```powershell
 .\.venv\Scripts\meeting-agent.exe chat
-```
-
-녹화 Workflow:
-
-```powershell
 .\.venv\Scripts\meeting-agent.exe record start
 .\.venv\Scripts\meeting-agent.exe record pause
 .\.venv\Scripts\meeting-agent.exe record resume
 .\.venv\Scripts\meeting-agent.exe record stop
-```
-
-현재 Agent State 확인:
-
-```powershell
 .\.venv\Scripts\meeting-agent.exe state
 ```
 
-## 더미 데이터
-
-기본 사용자는 `user-eric`, 기본 스레드는 `thread-eric`입니다.
-
-| ID | 제목 | `user-eric` 접근 |
-|---|---|---|
-| `meeting-001` | ZEN AI 제품 로드맵 회의 | 생성자 |
-| `meeting-002` | 3분기 마케팅 전략 회의 | 공유 |
-| `meeting-003` | 보안 검토 회의 | 공유 |
-| `meeting-004` | 재무 비공개 회의 | 접근 불가 |
-
 ## 테스트
+
+오프라인 테스트:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-테스트는 다음을 확인합니다.
+실제 DeepSeek 통합 테스트는 API 사용량이 발생하므로 키 파일을 지정할 때만 실행합니다.
 
-- 하나의 목표에서 Search 이후 Question이 이어지는지
-- 검증된 ID만 `authorized_meeting_ids`에 반영되는지
-- 회의록 원문이 Agent State·Checkpoint에 남지 않는지
-- Agent Checkpoint State가 설계의 세 필드만 가지는지
-- 복수 후보에서 HITL interrupt가 발생하는지
-- 후보 수 해석과 질문 Model Context가 모델 경계를 통과하는지
-- Tool 오류가 재시도 후 구조화되어 모델에 전달되는지
-- `ScratchPad`가 컨텍스트 예산 50%에서 Compact되는지
-- 녹화 State가 `none → recording ↔ pause → stop → none` 규칙을 따르는지
-- 정상적인 State 거부가 `recording_modal_status=error`로 처리되지 않는지
-- 모달 실행 오류가 Agent의 `recording_modal_status=error`에 동기화되는지
+```powershell
+$env:DEEPSEEK_API_KEY_FILE="C:\secure\DeepSeek API Key.txt"
+$env:DEEPSEEK_MODEL="deepseek-v4-pro"
+.\.venv\Scripts\python.exe -m unittest tests.test_deepseek_integration -v
+```
+
+## 실제 구현과 대역
+
+### 실제 검증 코드
+
+- Agent Graph·Search/Question Subgraph
+- State·Checkpoint·HITL
+- 실제 DeepSeek 호출과 구조화 판단값 검증
+- Tool 경계, 권한 재검증, 원문 비영속성
+- 결정적 녹화 Workflow와 Graph 제어 Loop
+
+### 제품 경계의 대역
+
+- CLI: 실제 ZEN AI 채팅 UI 대역
+- SQLite Repository: 인증·권한·회의록 Backend 대역
+- `recording_sessions`: 실제 녹화 모달·Backend 대역
+- `RuleBasedMeetingModel`: 오프라인 테스트용 LLM 대역
+- 프로세스 내부 Lock/HITL Context: 운영 Queue 대역
 
 ## POC 한계
 
-- 규칙 기반 더미 모델이므로 자연어 해석 범위가 제한적입니다.
-- SQLite Checkpointer는 로컬 데모와 소규모 POC 용도입니다.
-- 실제 ZEN AI 프론트엔드 모달·백엔드 API 대신 SQLite 서비스로 동작을 재현합니다.
-- HITL 실행 Context는 현재 프로세스 메모리에만 있으므로 프로세스를 재시작한 뒤의 실행 복구는 지원하지 않습니다.
-- 실제 배포에서는 인증 세션, 비밀 관리, 분산 큐·멱등성, 관측성과 운영 DB가 추가로 필요합니다.
+- 실제 프론트엔드·인증·업무 DB·녹화 Backend는 연결하지 않습니다.
+- SQLite Checkpointer와 Repository는 로컬 POC 용도입니다.
+- HITL Runtime Context는 프로세스 재시작 후 복구되지 않습니다.
+- 운영 환경에는 분산 Queue, 멱등성, 비밀 관리, 관측성과 실제 토큰 계산이 추가로 필요합니다.
+- 실제 `zen-ai` 이식 방식은 별도 문서에서 다루며 이 POC의 기술 검증 구조와 분리합니다.
