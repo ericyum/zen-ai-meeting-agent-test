@@ -95,6 +95,17 @@ def command_state(args: argparse.Namespace) -> None:
         print(json.dumps(state, ensure_ascii=False, indent=2, default=str))
 
 
+def command_serve(args: argparse.Namespace) -> None:
+    from .web_demo import serve
+
+    runtime = _runtime(args)
+    runtime.seed()
+    try:
+        serve(runtime, args.host, args.port, open_browser=not args.no_browser)
+    finally:
+        runtime.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ZEN AI meeting-agent LangGraph POC")
     parser.add_argument("--app-db", default="data/app.db")
@@ -133,6 +144,12 @@ def build_parser() -> argparse.ArgumentParser:
     state = sub.add_parser("state", help="현재 Agent Checkpoint State 확인")
     state.add_argument("--thread-id", default="thread-eric")
     state.set_defaults(func=command_state)
+
+    server = sub.add_parser("serve", help="발표용 Graph Trace 로컬 웹 서버")
+    server.add_argument("--host", default="127.0.0.1")
+    server.add_argument("--port", type=int, default=8765)
+    server.add_argument("--no-browser", action="store_true")
+    server.set_defaults(func=command_serve)
     return parser
 
 

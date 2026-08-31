@@ -111,6 +111,32 @@ $env:DEEPSEEK_MODEL="deepseek-v4-pro"
 .\.venv\Scripts\python.exe -m unittest tests.test_deepseek_integration -v
 ```
 
+## 발표용 로컬 Trace 서버
+
+브라우저에서 실제 LangGraph 실행의 Graph, Subgraph, Node, Edge와 State Snapshot을 순서대로 확인할 수 있습니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m meeting_agent `
+  --deepseek-key-file "C:\secure\DeepSeek API Key.txt" `
+  serve
+```
+
+기본 주소는 `http://127.0.0.1:8765`이며 브라우저가 자동으로 열립니다. 서버 종료는 터미널에서 `Ctrl+C`입니다.
+
+발표 입력 예시:
+
+```text
+/meeting-start
+meeting-001 회의록을 가져오고 결정 사항을 설명해줘
+/meeting-pause
+/meeting-resume
+/meeting-stop
+```
+
+복수 후보 HITL은 `회의록 검색해줘`로 발생시키고, 화면에 나온 후보를 `/select meeting-001`처럼 입력해 재개합니다. 기존 허용 ID가 있을 때 추가·대체 질문이 나오면 `/merge add` 또는 `/merge replace`를 입력합니다.
+
+Trace는 LangGraph의 실제 debug stream에서 생성합니다. 회의록 원문과 API 키는 화면 로그에 노출하지 않습니다.
+
 ## 실제 구현과 대역
 
 ### 실제 검증 코드

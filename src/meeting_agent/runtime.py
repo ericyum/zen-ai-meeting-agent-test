@@ -13,6 +13,7 @@ from .model import MeetingModel, RuleBasedMeetingModel
 from .recording_graph import build_recording_workflow
 from .repository import MeetingRepository
 from .state import AgentContext
+from .tracing import debug_stream_to_trace
 
 
 class MeetingAgentRuntime:
@@ -96,6 +97,46 @@ class MeetingAgentRuntime:
                 self._pending_contexts.pop(thread_id, None)
             return self._result_view(result)
 
+    def run_agent_traced(
+        self,
+        user_id: str,
+        thread_id: str,
+        request: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Run the real graph and convert LangGraph debug events for the demo UI."""
+
+        with self._lock_for(thread_id):
+            config = self._config(thread_id, "meeting-agent")
+            snapshot = self.agent_graph.get_state(config)
+            payload: dict[str, Any] = {
+                "recording_modal_status": self.repository.get_modal_status(thread_id)
+            }
+            if not snapshot.values:
+                payload.update({"ScratchPad": [], "authorized_meeting_ids": []})
+            context = AgentContext(user_id=user_id, thread_id=thread_id, request=request)
+            self._pending_contexts[thread_id] = context
+            chunks = list(
+                self.agent_graph.stream(
+                    payload,
+                    config,
+                    context=context,
+                    stream_mode="debug",
+                    subgraphs=True,
+                )
+            )
+            snapshot = self.agent_graph.get_state(config)
+            interrupts = [
+                interrupt
+                for task in snapshot.tasks
+                for interrupt in getattr(task, "interrupts", ())
+            ]
+            result = dict(snapshot.values)
+            if interrupts:
+                result["__interrupt__"] = interrupts
+            else:
+                self._pending_contexts.pop(thread_id, None)
+            return self._result_view(result), debug_stream_to_trace(chunks)
+
     def resume_agent(self, thread_id: str, answer: Any) -> dict[str, Any]:
         with self._lock_for(thread_id):
             context = self._pending_contexts.get(thread_id)
@@ -109,6 +150,37 @@ class MeetingAgentRuntime:
             if not result.get("__interrupt__"):
                 self._pending_contexts.pop(thread_id, None)
             return self._result_view(result)
+
+    def resume_agent_traced(
+        self, thread_id: str, answer: Any
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        with self._lock_for(thread_id):
+            context = self._pending_contexts.get(thread_id)
+            if context is None:
+                raise RuntimeError("현재 프로세스에 재개할 HITL 실행 컨텍스트가 없습니다.")
+            chunks = list(
+                self.agent_graph.stream(
+                    Command(resume=answer),
+                    self._config(thread_id, "meeting-agent"),
+                    context=context,
+                    stream_mode="debug",
+                    subgraphs=True,
+                )
+            )
+            snapshot = self.agent_graph.get_state(
+                self._config(thread_id, "meeting-agent")
+            )
+            interrupts = [
+                interrupt
+                for task in snapshot.tasks
+                for interrupt in getattr(task, "interrupts", ())
+            ]
+            result = dict(snapshot.values)
+            if interrupts:
+                result["__interrupt__"] = interrupts
+            else:
+                self._pending_contexts.pop(thread_id, None)
+            return self._result_view(result), debug_stream_to_trace(chunks)
 
     def run_recording(
         self, user_id: str, thread_id: str, command: str
