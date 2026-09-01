@@ -158,8 +158,7 @@ POC는 Python·LangGraph 독립 검증 구조로 되돌린다. `zen-ai` 조사 �
 `none`은 오류나 값 부재를 뜻하지 않는다. 현재 요청에 대해 수행할 후속 작업이 없어 입력 대기 또는 Graph 종료로 이동한다는 의미다. 실제 실행 종료는 다음처럼 표현한다.
 
 ```text
-llm_goal_condition: none
-→ request_finished
+고정 follow_up Condition: false
 → END
 ```
 
@@ -175,7 +174,7 @@ llm_goal_condition: none
 
 두 종류의 개념이 같은 화면에 섞여 있었다.
 
-- `graph_runtime_checkpoint`: 설계상의 업무 완료 경계 Node
+- Graph Runtime Checkpoint: 설계상의 업무 완료 경계이며 독립 업무 Node가 아님
 - LangGraph checkpoint event: 매 Super-step 뒤 복구를 위해 생성되는 기술 State Snapshot
 
 #### 결정
@@ -196,8 +195,7 @@ llm_goal_condition: none
 
 ```text
 이미 허용된 동일 ID
-→ S2_keep_existing_ids
-→ merge_mode: unchanged
+→ S2-B 또는 S2-C 내부에서 merge_mode: unchanged
 → HITL 없이 검색 응답
 ```
 
@@ -218,18 +216,36 @@ HITL 입력에서는 화면 사용성을 위해 영문 명령과 한국어 표�
 
 실행 방법은 Obsidian의 `3. POC 실행 및 테스트 방법.md`, 발표 흐름은 `6. 발표용 로컬 Trace 시연 가이드.md`에서 관리한다.
 
+### 3.9 원본 설계의 LLM·Condition 책임과 실시간 Trace 복원
+
+#### 문제
+
+회고형 As-built 구현이 Search·Question 결과 뒤마다 `decide_next_action()`을 다시 호출해 최종 `none`까지 LLM이 판단하도록 바뀌어 있었다. 후보 경로는 반대로 코드가 계산했고, Question의 Q1·Q2·Q3는 실제 책임이 분리되지 않았다. 브라우저 Trace도 Graph 완료 후 수집된 이벤트를 110ms 간격으로 재생했다.
+
+#### 결정
+
+- 원본 설계를 구현의 최우선 기준으로 되돌린다.
+- Tool 1 후보 결과의 `none/one/many` 해석은 LLM이 구조화해 반환한다.
+- Search·Question LLM은 `response + follow_up`을 함께 반환한다.
+- 하네스의 고정 Condition이 `follow_up`을 읽어 LLM 판단 복귀 또는 END를 선택한다.
+- 최종 종료 확인만을 위한 별도 LLM `none` 호출을 제거한다.
+- Question은 Q1 원문 조회, Q2 결과별 Context 조립, Q3 답변 생성으로 실제 책임을 나눈다.
+- Graph Runtime 공통 처리를 별도 업무 Node나 `business_checkpoint` 이벤트로 만들지 않는다.
+- LangGraph debug event는 SSE로 즉시 브라우저에 전달하고 인위적 재생 지연을 제거한다.
+
 ## 4. 현재 설계에 남은 핵심 결정
 
 | 주제 | 채택한 결정 | 채택하지 않은 방향 |
 |---|---|---|
 | POC 구조 | 독립 Python·LangGraph | `zen-ai` 제품 골격의 사전 복제 |
-| 목표 종료 | `none → request_finished → END` | 별도 `done` 상태 |
+| 목표 종료 | `response.follow_up=false → 고정 Condition → none/END` | 최종 `none` 확인용 LLM 호출, 별도 `done` 상태 |
 | 녹화 | LLM 없는 결정적 Workflow | LLM의 자유로운 녹화 상태 조작 |
 | Model | 실제 DeepSeek + rule-based 대역 | 실제 API만으로 모든 테스트 수행 |
 | 원문 | Node 지역 Context에서만 사용 | Agent State·Checkpoint 저장 |
 | 권한 | Repository/Backend에서 검색·조회 시 검증 | LLM 판단에 권한 위임 |
 | HITL | 여러 후보와 새 ID 추가·대체에 사용 | 동일 허용 ID에도 반복 질문 |
-| Checkpoint 표시 | 업무 경계와 기술 Snapshot 분리 | 모든 Snapshot을 동일한 업무 Checkpoint로 표현 |
+| Checkpoint 표시 | 결과 반영 Snapshot을 업무 경계로 해석하고 기술 Snapshot은 기본 숨김 | 별도 `graph_runtime_checkpoint` 업무 Node |
+| Trace 전송 | SSE Graph 이벤트 실시간 표시 | 실행 완료 후 110ms 사후 재생 |
 | 제품 이식 | 책임·계약·테스트를 번역 | Python 코드를 TypeScript로 줄 단위 복사 |
 | Git 작업 | 현재 작업공간에서 사용자 요청 범위만 수정 | 자동 branch/worktree/commit/PR |
 

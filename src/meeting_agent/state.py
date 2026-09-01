@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypedDict
 
+from langgraph.channels import UntrackedValue
 
-Action = Literal["search", "question", "direct", "none"]
+
 RecordingModalStatus = Literal["healthy", "error"]
 RecordingCommand = Literal["start", "pause", "resume", "stop"]
 
@@ -16,7 +17,10 @@ def reduce_scratchpad(
 
     if isinstance(update, dict) and "__replace__" in update:
         return list(update["__replace__"])
-    return list(current) + list(update)
+    incoming = list(update)
+    if incoming[: len(current)] == list(current):
+        return incoming
+    return list(current) + incoming
 
 
 class AgentState(TypedDict, total=False):
@@ -48,6 +52,7 @@ class SearchState(AgentState, total=False):
     merge_mode: Literal["set", "add", "replace", "unchanged", ""]
     tool_status: Literal["ok", "failed"]
     tool_error: dict[str, Any]
+    candidate_route: Literal["none", "one", "many", "failed"]
 
 
 class QuestionState(AgentState, total=False):
@@ -55,6 +60,8 @@ class QuestionState(AgentState, total=False):
 
     tool_status: Literal["selection_required", "source_ready", "source_denied_or_failed"]
     last_result: dict[str, Any]
+    documents: Annotated[list[dict[str, str]], UntrackedValue]
+    model_context: Annotated[dict[str, Any], UntrackedValue]
 
 
 class RecordingWorkflowState(TypedDict, total=False):

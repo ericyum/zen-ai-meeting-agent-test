@@ -38,13 +38,14 @@ def _resume_value(payload: dict[str, Any]) -> Any:
 def _run_with_interrupts(
     runtime: MeetingAgentRuntime,
     result: dict[str, Any],
+    user_id: str,
     thread_id: str,
 ) -> dict[str, Any]:
     while True:
         payload = interrupt_payload(result)
         if payload is None:
             return result
-        result = runtime.resume_agent(thread_id, _resume_value(payload))
+        result = runtime.resume_agent(user_id, thread_id, _resume_value(payload))
 
 
 def command_seed(args: argparse.Namespace) -> None:
@@ -57,7 +58,7 @@ def command_ask(args: argparse.Namespace) -> None:
     with _runtime(args) as runtime:
         runtime.seed()
         result = runtime.run_agent(args.user_id, args.thread_id, args.request)
-        result = _run_with_interrupts(runtime, result, args.thread_id)
+        result = _run_with_interrupts(runtime, result, args.user_id, args.thread_id)
         print(result.get("response", ""))
         if args.debug:
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
@@ -74,7 +75,7 @@ def command_chat(args: argparse.Namespace) -> None:
             if not request:
                 continue
             result = runtime.run_agent(args.user_id, args.thread_id, request)
-            result = _run_with_interrupts(runtime, result, args.thread_id)
+            result = _run_with_interrupts(runtime, result, args.user_id, args.thread_id)
             print(f"Agent> {result.get('response', '')}")
 
 
@@ -91,7 +92,7 @@ def command_record(args: argparse.Namespace) -> None:
 
 def command_state(args: argparse.Namespace) -> None:
     with _runtime(args) as runtime:
-        state = runtime.get_agent_state(args.thread_id)
+        state = runtime.get_agent_state(args.user_id, args.thread_id)
         print(json.dumps(state, ensure_ascii=False, indent=2, default=str))
 
 

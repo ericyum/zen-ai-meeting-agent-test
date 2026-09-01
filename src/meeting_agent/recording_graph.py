@@ -22,13 +22,17 @@ def build_recording_workflow(repository: MeetingRepository):
                 "recording_modal_status": result.modal_status,
                 "response": result.message,
             }
-        except Exception as exc:  # POC boundary for modal/connection errors.
-            repository.set_modal_status(state["thread_id"], "error")
+        except Exception:  # POC boundary for modal/connection errors.
+            try:
+                repository.set_modal_status(state["thread_id"], "error")
+                current_state = repository.get_recording_state(state["thread_id"])
+            except Exception:
+                current_state = "none"
             return {
-                "previous_state": repository.get_recording_state(state["thread_id"]),
-                "current_state": repository.get_recording_state(state["thread_id"]),
+                "previous_state": current_state,
+                "current_state": current_state,
                 "recording_modal_status": "error",
-                "response": f"녹화 모달 실행 오류: {exc}",
+                "response": "녹화 모달을 실행하지 못했습니다. 잠시 후 다시 시도해주세요.",
             }
 
     builder.add_node("recording_modal_and_backend", execute_modal)

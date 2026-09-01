@@ -10,6 +10,14 @@ from typing import Any
 from .runtime import MeetingAgentRuntime, interrupt_payload
 
 
+def encode_sse(event: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n".encode("utf-8")
+
+
+def public_error_event(_error: Exception) -> dict[str, str]:
+    return {"type": "error", "message": "요청을 처리하지 못했습니다."}
+
+
 HTML = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>ZEN AI 회의록 Agent POC Trace</title>
@@ -32,17 +40,9 @@ meeting-001 회의록을 가져오고 결정 사항을 설명해줘
 const form=document.querySelector('#form'), input=document.querySelector('#input'), send=document.querySelector('#send'), messages=document.querySelector('#messages'), trace=document.querySelector('#trace'), spinner=document.querySelector('#spinner'), showSnapshots=document.querySelector('#showSnapshots');
 const addMsg=(text,kind)=>{const d=document.createElement('div');d.className='msg '+kind;d.textContent=text;messages.appendChild(d);messages.scrollTop=messages.scrollHeight};
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-async function animate(events){trace.innerHTML='';for(const e of events){if(e.type==='state'&&!showSnapshots.checked)continue;const business=e.node==='graph_runtime_checkpoint';const d=document.createElement('div');d.className='event '+(e.graph!=='Agent Graph'?'sub ':'')+(e.type==='state'?'state ':'')+(business?'business':'');let detail='';if(e.type==='state')detail=`<span class="edge">${esc(e.edge)}</span><pre>${esc(JSON.stringify(e.state,null,2))}</pre>`;else{const decision=e.decision==='none'?'none (입력 대기·종료)':e.decision;detail=`${e.phase==='start'?'NODE 시작':'NODE 완료'}${business?' · <strong>업무 경계 Checkpoint</strong>':''}${decision?` · <strong class="edge">Agent State 판단: ${esc(decision)}</strong>`:''}${e.edge?` · <span class="edge">${esc(e.edge)}</span>`:''}${e.output&&Object.keys(e.output).length?`<pre>${esc(JSON.stringify(e.output,null,2))}</pre>`:''}`}const label=e.type==='state'?'기술 State Snapshot (LangGraph 복구용)':(e.node??'Node');d.innerHTML=`<div class="title">${esc(e.graph)} · ${esc(label)}</div><div class="meta">step ${esc(e.step)} · ${detail}</div>`;trace.appendChild(d);trace.scrollTop=trace.scrollHeight;await new Promise(r=>setTimeout(r,110));}}
-form.addEventListener('submit',async ev=>{ev.preventDefault();const command=input.value.trim();if(!command)return;addMsg(command,'user');input.value='';send.disabled=true;spinner.style.display='inline';try{const res=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command})});const data=await res.json();if(!res.ok)throw new Error(data.error||'실행 실패');await animate(data.trace||[]);addMsg(data.response||'(응답 없음)','agent');if(data.interrupt)addMsg(`HITL: ${data.interrupt.message}\n${JSON.stringify(data.interrupt,null,2)}`,'system')}catch(e){addMsg('오류: '+e.message,'system')}finally{send.disabled=false;spinner.style.display='none';input.focus()}});input.focus();
+function appendTrace(e){if(e.type==='state'&&!showSnapshots.checked)return;const business=e.type==='business_checkpoint';const d=document.createElement('div');d.className='event '+(e.graph!=='Agent Graph'?'sub ':'')+(e.type==='state'?'state ':' )+(business?'business ':' );let detail='';if(e.type==='state'||business)detail=`<span class="edge">${esc(e.edge)}</span><pre>${esc(JSON.stringify(e.state,null,2))}</pre>`;else{detail=`${e.phase==='start'?'NODE 시작':'NODE 완료'}${e.decision?` · <strong class="edge">Agent State 판단: ${esc(e.decision)}</strong>`:''}${e.edge?` · <span class="edge">${esc(e.edge)}</span>`:''}${e.output&&Object.keys(e.output).length?`<pre>${esc(JSON.stringify(e.output,null,2))}</pre>`:''}`}const label=e.type==='state'?'기술 State Snapshot (LangGraph 복구용)':business?'업무 Checkpoint 갱신':(e.node??'Node');d.innerHTML=`<div class="title">${esc(e.graph)} · ${esc(label)}</div><div class="meta">${e.step!==undefined?`step ${esc(e.step)} · `:''}${detail}</div>`;trace.appendChild(d);trace.scrollTop=trace.scrollHeight}
+form.addEventListener('submit',async ev=>{ev.preventDefault();const command=input.value.trim();if(!command)return;addMsg(command,'user');input.value='';trace.innerHTML='';send.disabled=true;spinner.style.display='inline';try{const res=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command})});if(!res.ok)throw new Error(await res.text()||'실행 실패');const reader=res.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});const frames=buffer.split('\n\n');buffer=frames.pop();for(const frame of frames){const line=frame.split('\n').find(item=>item.startsWith('data: '));if(!line)continue;const data=JSON.parse(line.slice(6));if(data.type==='final'){addMsg(data.response||'(응답 없음)','agent');if(data.interrupt)addMsg(`HITL: ${data.interrupt.message}\n${JSON.stringify(data.interrupt,null,2)}`,'system')}else if(data.type==='error'){throw new Error(data.message)}else appendTrace(data)}if(done)break}}catch(e){addMsg('오류: '+e.message,'system')}finally{send.disabled=false;spinner.style.display='none';input.focus()}});input.focus();
 </script></body></html>"""
-
-
-def recording_trace(command: str, result: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {"type": "node", "phase": "start", "graph": "Recording Workflow", "node": "recording_modal_and_backend", "step": 1, "edge": "START → recording_modal_and_backend"},
-        {"type": "node", "phase": "end", "graph": "Recording Workflow", "node": "recording_modal_and_backend", "step": 1, "output": {"command": command, "previous_state": result["previous_state"], "current_state": result["current_state"], "recording_modal_status": result["recording_modal_status"]}},
-        {"type": "state", "graph": "Recording Workflow", "step": 1, "edge": "→ END", "state": {"current_state": result["current_state"], "recording_modal_status": result["recording_modal_status"]}},
-    ]
 
 
 def serve(runtime: MeetingAgentRuntime, host: str, port: int, open_browser: bool = True) -> None:
@@ -65,17 +65,39 @@ def serve(runtime: MeetingAgentRuntime, host: str, port: int, open_browser: bool
                 command = str(body.get("command", "")).strip(); thread_id = "presentation-thread"; user_id = "user-eric"
                 aliases = {"/meeting-start": "start", "/meeting-pause": "pause", "/meeting-resume": "resume", "/meeting-stop": "stop"}
                 if command in aliases:
-                    result = runtime.run_recording(user_id, thread_id, aliases[command]); trace = recording_trace(aliases[command], result)
+                    events = runtime.iter_recording_traced(
+                        user_id, thread_id, aliases[command]
+                    )
                 elif command.startswith("/select "):
-                    ids = [item.strip() for item in command[8:].split(",") if item.strip()]; result, trace = runtime.resume_agent_traced(thread_id, {"meeting_ids": ids})
+                    ids = [item.strip() for item in command[8:].split(",") if item.strip()]
+                    events = runtime.iter_resume_agent_traced(user_id, thread_id, {"meeting_ids": ids})
                 elif command.startswith("/merge ") or command in {"추가", "대체", "add", "replace"}:
                     mode = command[7:].strip() if command.startswith("/merge ") else {"추가": "add", "대체": "replace"}.get(command, command)
-                    result, trace = runtime.resume_agent_traced(thread_id, {"mode": mode})
+                    events = runtime.iter_resume_agent_traced(user_id, thread_id, {"mode": mode})
                 else:
-                    result, trace = runtime.run_agent_traced(user_id, thread_id, command)
-                self._json(200, {"response": result.get("response", ""), "trace": trace, "state": runtime.get_agent_state(thread_id), "interrupt": interrupt_payload(result)})
+                    events = runtime.iter_agent_traced(user_id, thread_id, command)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for event in events:
+                    if event["type"] == "final":
+                        result = event["result"]
+                        event = {
+                            "type": "final",
+                            "response": result.get("response", ""),
+                            "state": runtime.get_agent_state(user_id, thread_id),
+                            "interrupt": interrupt_payload(result),
+                        }
+                    self.wfile.write(encode_sse(event))
+                    self.wfile.flush()
             except Exception as exc:
-                self._json(500, {"error": str(exc)})
+                try:
+                    self.wfile.write(encode_sse(public_error_event(exc)))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
     server = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}"

@@ -36,6 +36,12 @@ class DeepSeekIntegrationTest(unittest.TestCase):
         event_kinds = [event.get("kind") for event in result["ScratchPad"]]
         self.assertIn("search_response", event_kinds)
         self.assertIn("question_response", event_kinds)
+        actions = [
+            event.get("action")
+            for event in result["ScratchPad"]
+            if event.get("kind") == "llm_decision"
+        ]
+        self.assertEqual(actions, ["search", "question"])
 
 
 if __name__ == "__main__":

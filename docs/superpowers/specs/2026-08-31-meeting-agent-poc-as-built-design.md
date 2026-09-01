@@ -98,18 +98,20 @@ DeepSeek/테스트 Model    권한·회의록·녹화 Backend 대역
 
 `AgentContext`의 `user_id`, `thread_id`, `request`는 호출마다 전달되며 Agent Checkpoint에 저장하지 않는다.
 
-회의록 원문도 Question Node의 지역 변수와 Model Context에서만 사용한다. State에는 답변, 상태와 문서 ID·제목 같은 메타데이터만 남긴다.
+회의록 원문은 Question Subgraph의 `UntrackedValue` 메모리 채널과 Model Context에서만 사용한다. 이 채널은 기술 Snapshot에 직렬화되지 않는다. State에는 답변, 상태와 문서 제목·개수만 남긴다.
+
+Checkpoint, 실행 Lock과 HITL 재개 Context는 `(user_id, thread_id)` 조합으로 격리한다. `resume_agent`도 인증 사용자 ID를 함께 받는다.
 
 ### 5.3 목표 상태 용어
 
-목표 판단 결과는 `search`, `question`, `direct`, `none`이다.
+개념적 Graph State는 `search`, `question`, `none`이다. Model의 최초 routing 결과에는 Tool 없는 응답을 뜻하는 `direct`도 사용한다.
 
 - `search`: 회의 후보를 찾고 사용 가능한 ID를 확정해야 한다.
 - `question`: 권한이 검증된 회의록을 근거로 답해야 한다.
-- `direct`: Tool 없이 직접 응답할 수 있다.
+- `direct`: 지속 State가 아니라 `none`을 유지한 채 Tool 없이 응답하는 routing 결과다.
 - `none`: 현재 목표의 후속 작업이 없으며 입력 대기 또는 실행 종료로 이동한다.
 
-설계에 없는 `done` 상태는 사용하지 않는다. 실행 종료는 `none` 판단 뒤 `request_finished`와 LangGraph `END`로 표현한다.
+설계에 없는 `done` 상태는 사용하지 않는다. Search·Question 응답의 `follow_up=False`를 고정 Condition이 읽으면 상위 State를 `none`으로 정리한 뒤 LangGraph `END`로 바로 이동한다.
 
 ## 6. 최상위 Agent Graph
 
@@ -121,33 +123,30 @@ START
    ├─ search   → Search Subgraph
    ├─ question → Question Subgraph
    ├─ direct   → direct_response
-   └─ none     → request_finished → END
 
-Search/Question/direct 결과
-→ graph_runtime_checkpoint
-→ compact_scratchpad
-→ llm_goal_condition
+Search/Question 결과
+→ 응답의 follow_up을 읽는 고정 Condition
+   ├─ true  → compact_scratchpad → llm_goal_condition
+   └─ false → END
+
+direct 결과 → END
 ```
 
 핵심은 한 번의 사용자 요청에서 하나의 Tool만 실행하고 끝내지 않는다는 것이다. 예를 들어 “회의록을 가져오고 결정 사항을 설명해줘”는 Search 완료 후 목표를 다시 판단하여 Question까지 이어진다.
 
-`graph_runtime_checkpoint`는 하나의 업무 단위가 끝났음을 ScratchPad에 기록하는 설계상의 Node다.
+Search·Question Model은 사용자 응답과 `follow_up`을 함께 구조화해 반환한다. Graph Runtime은 결과가 State에 반영된 LangGraph Snapshot을 업무 Checkpoint로 사용하고, 고정 Condition이 다음 Edge를 선택한다. 종료 확인만을 위한 별도 LLM `none` 호출은 없다.
 
 ## 7. Search Subgraph
 
 ```text
 START
-→ S1_tool_1_search
-→ 후보/오류 분기
-   ├─ 오류   → S2_tool_failed
+→ S1_candidate_search_and_judgment
+→ 후보/오류 고정 분기
+   ├─ 오류   → S3_search_response_ready
    ├─ 0개    → S2A_no_candidates
-   ├─ 1개    → S2B_auto_select
-   └─ 여러 개 → S2C_hitl_select
-→ 기존 허용 ID와 비교
-   ├─ 선택 없음       → 응답
-   ├─ 최초 선택       → S2_set_new_ids
-   ├─ 이미 허용됨     → S2_keep_existing_ids
-   └─ 새로운 ID 포함  → S2_hitl_add_or_replace
+   ├─ 1개    → S2B_one_candidate
+   └─ 여러 개 → S2C_multiple_candidates
+→ 각 S2 Node 내부에서 선택 검증·최초 설정·중복 유지·추가/대체 HITL 처리
 → S3_search_response_ready
 → END
 ```
@@ -159,22 +158,28 @@ START
 - 여러 후보는 모델이 임의 확정하지 않고 사용자 선택을 받는다.
 - 기존 ID와 새 ID가 충돌하면 `add` 또는 `replace`를 사용자가 결정한다.
 - 이미 허용된 동일 ID의 반복 선택은 `unchanged`로 처리해 불필요한 HITL을 만들지 않는다.
+- 후보 밖 ID와 잘못된 추가·대체 값은 같은 HITL에서 오류 이유와 함께 다시 묻는다.
+- HITL 대기 중 일반 요청은 새 실행으로 처리하지 않고 현재 interrupt를 다시 반환한다.
+- 선택 재검증에서 권한 거부나 Backend 오류가 발생하면 구조화된 실패 결과로 S3 안내 경로에 합류한다.
 - Tool 예외는 최대 2회 시도 후 구조화 오류로 변환한다.
+- 내부 예외 문자열은 Model Context, State, Checkpoint와 Trace에 넣지 않고 고정된 공개 메시지로 치환한다.
 
 ## 8. Question Subgraph
 
 ```text
 START
-→ Q1_tool_2_context_and_answer
+→ Q1_tool_2_source_lookup
 → 결과 분기
-   ├─ selection_required
-   ├─ source_ready
-   └─ source_denied_or_failed
-→ Q3_question_response_ready
+   ├─ Q2A_build_selection_context
+   ├─ Q2B_build_source_context
+   └─ Q2C_build_failure_context
+→ Q3_question_response
 → END
 ```
 
-Question Subgraph는 `authorized_meeting_ids`가 있을 때만 원문을 조회한다. Repository는 현재 사용자 권한을 다시 검사한다. 실제 문서 본문은 Model 호출에만 전달하고 ScratchPad에는 답변과 문서 메타데이터만 기록한다.
+Question Subgraph는 `authorized_meeting_ids`가 있을 때만 원문을 조회한다. Q1은 조회, Q2는 결과별 Model Context 조립, Q3는 최종 LLM 답변을 담당한다. Repository는 현재 사용자 권한을 다시 검사한다. 실제 문서 본문은 `UntrackedValue`로만 Q3까지 전달하고 Model 호출 후 버린다. ScratchPad에는 답변과 문서 제목·개수만 기록한다.
+
+원문 재검증에서 접근 권한이 사라진 경우는 `UNAUTHORIZED_MEETING_ID`, 그 밖의 Backend 장애는 `TOOL_EXECUTION_FAILED`로 구분한다. 두 결과 모두 회의록 ID와 내부 예외 문자열은 Model Context에 포함하지 않는다.
 
 ## 9. 녹화 Workflow
 
@@ -188,12 +193,15 @@ START
 
 Repository 대역이 실제 녹화 상태를 소유하고, 성공 여부를 `recording_modal_status`로 Agent Checkpoint에 동기화한다. 이 상태 모델은 실제 제품 모달을 복제한 것이 아니다. 향후 이식 시에는 `zen-ai`의 Recording Provider와 BackendAdapter 계약을 사용해야 한다.
 
+모달의 `none → recording ↔ pause → stop → none` 다이어그램은 모달 내부 상태 모델이다. POC LangGraph는 이 상태 머신을 Agent 쪽에 복제하지 않고, 고정 Trigger를 모달 대역에 전달하고 결과 신호를 받는 단일 실행 경계만 표현한다.
+
 ## 10. Model 경계
 
 ### 실제 코드: `DeepSeekMeetingModel`
 
 - OpenAI 호환 DeepSeek Chat Completions API를 호출한다.
 - 기본 실행 Provider이며 모델 이름으로 `deepseek-v4-pro`를 지정할 수 있다.
+- Graph의 구조화 JSON 판정·응답에는 `thinking.type=disabled`를 명시한다. 이 POC의 Model 책임은 자유로운 장기 추론이 아니라 정해진 Schema를 채우는 것이므로, 기본 high Thinking으로 인한 지연과 `max_tokens` 소진을 피한다.
 - 목표 판단 결과를 허용된 enum으로 검증한다.
 - API 키는 코드에 포함하지 않고 실행 시 외부 키 파일 또는 환경 설정에서 읽는다.
 
@@ -209,17 +217,19 @@ Repository 대역이 실제 녹화 상태를 소유하고, 성공 여부를 `rec
 
 ### 11.1 업무 경계 Checkpoint
 
-`graph_runtime_checkpoint`는 Search·Question·direct 같은 업무 결과 뒤에 실행되는 명시적 Graph Node다. 목표를 다시 판단하기 전에 업무 완료 경계를 남긴다.
+업무 결과가 부모 State에 반영된 LangGraph Snapshot을 업무 Checkpoint로 사용한다. Graph Runtime 공통 처리를 별도의 Agent 업무 Node나 `business_checkpoint` ScratchPad 이벤트로 만들지 않는다.
 
 ### 11.2 기술 State Snapshot
 
 LangGraph의 SQLite Checkpointer는 복구를 위해 매 Super-step 뒤 기술 Snapshot을 만든다. 이것은 설계도에 표시된 업무 Checkpoint가 아니다.
 
-Trace UI는 혼동을 막기 위해 기술 Snapshot을 기본적으로 숨긴다. 사용자가 옵션을 켰을 때만 표시하며, 업무 경계 Node는 항상 별도로 보인다.
+Trace UI는 기술 Snapshot을 기본적으로 숨기고 사용자가 옵션을 켰을 때만 표시한다.
 
 ### 11.3 Trace 보안
 
-Trace는 실제 `stream_mode="debug"` 이벤트를 변환한다. Graph와 Subgraph namespace, Node 시작·완료, Edge와 안전한 State를 보여주되 회의록 `transcript`와 API 키는 제거한다.
+Trace는 실제 `stream_mode="debug"` 이벤트를 하나씩 변환해 SSE로 즉시 전달한다. Agent Graph뿐 아니라 Recording Workflow도 실제 debug stream에서 Node 시작·완료와 END Edge를 표시한다. 모달 결과가 `recording_modal_status`에 반영된 뒤에는 실제 Agent Checkpoint 동기화 완료 이벤트를 이어서 표시한다. Graph와 Subgraph namespace, Node 시작·완료, Edge와 안전한 State를 보여주되 회의록 `transcript`, API 키와 내부 예외 문자열은 제거한다.
+
+ScratchPad Compact는 오래된 사건의 종류와 핵심 의미를 제한된 길이로 보존하고, 현재 목표 사건도 크기를 제한해 다음 Model 호출이 문자 기반 50% 임계값 아래로 내려가게 한다. 실제 제품 이식 시에는 문자 수 대신 사용하는 모델의 Tokenizer로 교체한다.
 
 ## 12. 실제 구현과 대역의 경계
 

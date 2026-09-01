@@ -21,6 +21,13 @@ SYSTEM_INSTRUCTION = (
 MODEL_CONTEXT_BUDGET_CHARS = 8_000
 TOOL_ATTEMPTS = 2
 T = TypeVar("T")
+CORE_EVENT_KINDS = {
+    "user_request",
+    "llm_decision",
+    "search_response",
+    "question_response",
+    "direct_response",
+}
 
 
 def _event(kind: str, **payload: Any) -> dict[str, Any]:
@@ -39,7 +46,9 @@ def _current_goal_events(state: AgentState) -> list[dict[str, Any]]:
     return events
 
 
-def _call_with_retry(operation: Callable[[], T]) -> tuple[T | None, dict[str, Any] | None]:
+def _call_with_retry(
+    operation: Callable[[], T], *, permission_error_code: str | None = None
+) -> tuple[T | None, dict[str, Any] | None]:
     last_error: Exception | None = None
     for _attempt in range(1, TOOL_ATTEMPTS + 1):
         try:
@@ -48,21 +57,115 @@ def _call_with_retry(operation: Callable[[], T]) -> tuple[T | None, dict[str, An
             last_error = exc
     assert last_error is not None
     return None, {
-        "code": "TOOL_EXECUTION_FAILED",
-        "message": str(last_error),
+        "code": (
+            permission_error_code
+            if permission_error_code and isinstance(last_error, PermissionError)
+            else "TOOL_EXECUTION_FAILED"
+        ),
+        "message": "Tool 실행에 실패했습니다.",
         "attempts": TOOL_ATTEMPTS,
         "retryable": False,
+    }
+
+
+def _compact_event(event: dict[str, Any], text_limit: int = 300) -> dict[str, Any]:
+    """Keep goal-loop meaning while removing large or server-managed payloads."""
+
+    compacted: dict[str, Any] = {"kind": str(event.get("kind", "unknown"))[:60]}
+    for key in (
+        "request", "response", "payload", "action", "status", "mode",
+        "follow_up", "selected_count", "document_count", "selected_titles",
+        "document_titles",
+    ):
+        value = event.get(key)
+        if isinstance(value, str):
+            compacted[key] = value[:text_limit]
+        elif isinstance(value, (bool, int, float)) or value is None:
+            if key in event:
+                compacted[key] = value
+        elif isinstance(value, list):
+            compacted[key] = [str(item)[:100] for item in value[:10]]
+    return compacted
+
+
+def _latest_event_per_kind(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest = {
+        str(event.get("kind", "unknown"))[:60]: (index, event)
+        for index, event in enumerate(events)
+    }
+    return [event for _, event in sorted(latest.values())]
+
+
+def compact_scratchpad_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a semantic, bounded ScratchPad for the next Model call."""
+
+    current_goal = _current_goal_events({"ScratchPad": events})
+    old_events = events[: len(events) - len(current_goal)]
+    old_core = _latest_event_per_kind(old_events)[-8:]
+    current_core = _latest_event_per_kind(
+        [
+            event
+            for event in current_goal
+            if str(event.get("kind", "unknown")) in CORE_EVENT_KINDS
+        ]
+    )
+    event_kinds = dict(
+        Counter(str(item.get("kind", "unknown"))[:60] for item in old_events).most_common(8)
+    )
+    target = MODEL_CONTEXT_BUDGET_CHARS // 2
+    for text_limit in (300, 160, 80, 40):
+        replacement = [
+            _event(
+                "compact_summary",
+                compacted_event_count=len(old_events),
+                event_kinds=event_kinds,
+                history=[_compact_event(item, text_limit) for item in old_core],
+            ),
+            *(_compact_event(item, text_limit) for item in current_core),
+        ]
+        if len(json.dumps(replacement, ensure_ascii=False, default=str)) < target:
+            return replacement
+
+    fallback = [
+        _event("compact_summary", compacted_event_count=len(events)),
+        *(_compact_event(item, 40) for item in current_core),
+    ]
+    if len(json.dumps(fallback, ensure_ascii=False, default=str)) >= target:
+        raise RuntimeError("ScratchPad Compact 결과가 Context 예산을 초과했습니다.")
+    return fallback
+
+
+def _without_full_sources(
+    response: dict[str, Any], documents: list[dict[str, str]]
+) -> dict[str, Any]:
+    text = response.get("response", "")
+    source_bodies = []
+    for document in documents:
+        transcript = document.get("transcript", "").strip()
+        source_bodies.extend([transcript, transcript.partition(":")[2].strip()])
+    if not any(source and source in text for source in source_bodies):
+        return response
+    summaries = "\n".join(
+        f"- {document['title']} 요약: {document['summary']}" for document in documents
+    )
+    return {
+        **response,
+        "response": f"선택된 회의록을 기준으로 확인한 내용입니다.\n{summaries}",
     }
 
 
 def build_search_subgraph(repository: MeetingRepository, model: MeetingModel):
     builder = StateGraph(SearchState, context_schema=AgentContext)
 
-    def tool_1_search(
+    def search_and_judge_candidates(
         state: SearchState, runtime: Runtime[AgentContext]
     ) -> dict[str, Any]:
+        decision = next(
+            event for event in reversed(state.get("ScratchPad", []))
+            if event.get("kind") == "llm_decision" and event.get("action") == "search"
+        )
         candidates, error = _call_with_retry(
-            lambda: repository.search_meetings(runtime.context.user_id, runtime.context.request)
+            lambda: repository.search_meetings(runtime.context.user_id, decision["search_query"])
         )
         if error:
             return {
@@ -71,98 +174,126 @@ def build_search_subgraph(repository: MeetingRepository, model: MeetingModel):
                 "merge_mode": "",
                 "tool_status": "failed",
                 "tool_error": error,
+                "candidate_route": "failed",
             }
+        candidates = candidates or []
+        route = model.interpret_candidate_count(
+            runtime.context.request,
+            len(candidates),
+            state.get("ScratchPad", []),
+        )["route"]
         return {
-            "candidates": candidates or [],
+            "candidates": candidates,
             "selected_ids": [],
             "merge_mode": "",
             "tool_status": "ok",
             "tool_error": {},
+            "candidate_route": route,
         }
 
-    def candidate_route(
-        state: SearchState, runtime: Runtime[AgentContext]
-    ) -> str:
-        if state.get("tool_status") == "failed":
-            return "failed"
-        return model.interpret_candidate_count(
-            runtime.context.request,
-            state.get("candidates", []),
-            state.get("ScratchPad", []),
-        )
+    def candidate_route(state: SearchState) -> str:
+        return state["candidate_route"]
 
     def no_candidates(state: SearchState) -> dict[str, Any]:
         return {"selected_ids": [], "merge_mode": ""}
 
-    def tool_failed(state: SearchState) -> dict[str, Any]:
-        return {"selected_ids": [], "merge_mode": ""}
+    def merge_selected_ids(state: SearchState) -> dict[str, Any]:
+        selected_ids = state["selected_ids"]
+        existing_ids = state.get("authorized_meeting_ids", [])
+        if not existing_ids:
+            return {"authorized_meeting_ids": selected_ids, "merge_mode": "set"}
+        if set(selected_ids).issubset(set(existing_ids)):
+            return {"merge_mode": "unchanged"}
+        prompt = {
+            "kind": "id_merge",
+            "message": "기존 허용 ID 목록에 새 ID를 추가할지, 새 목록으로 대체할지 선택하세요.",
+            "existing_ids": existing_ids,
+            "new_ids": selected_ids,
+            "choices": ["add", "replace"],
+        }
+        while True:
+            answer = interrupt(prompt)
+            mode = answer.get("mode") if isinstance(answer, dict) else str(answer)
+            if mode in {"add", "replace"}:
+                break
+            prompt = {**prompt, "error": "mode는 add 또는 replace여야 합니다."}
+        ids = (
+            list(dict.fromkeys(existing_ids + selected_ids))
+            if mode == "add"
+            else selected_ids
+        )
+        return {"authorized_meeting_ids": ids, "merge_mode": mode}
 
-    def auto_select(
+    def one_candidate(
         state: SearchState, runtime: Runtime[AgentContext]
     ) -> dict[str, Any]:
         candidate = state["candidates"][0]
-        selected = repository.validate_selection(
-            runtime.context.user_id, [candidate["id"]], [candidate["id"]]
-        )
-        return {"selected_ids": selected}
+        try:
+            selected = repository.validate_selection(
+                runtime.context.user_id, [candidate["id"]], [candidate["id"]]
+            )
+        except Exception:
+            return {
+                "selected_ids": [],
+                "merge_mode": "",
+                "tool_status": "failed",
+                "tool_error": {
+                    "code": "SELECTION_VALIDATION_FAILED",
+                    "message": "선택한 회의록을 다시 검증하지 못했습니다.",
+                    "attempts": 1,
+                    "retryable": False,
+                },
+            }
+        return {"selected_ids": selected, **merge_selected_ids({**state, "selected_ids": selected})}
 
-    def hitl_select(
+    def multiple_candidates(
         state: SearchState, runtime: Runtime[AgentContext]
     ) -> dict[str, Any]:
-        answer = interrupt(
-            {
-                "kind": "meeting_selection",
-                "message": "접근 가능한 후보가 여러 개입니다. 하나 이상의 meeting_id를 선택하세요.",
-                "candidates": state["candidates"],
-            }
-        )
-        selected_ids = answer.get("meeting_ids", []) if isinstance(answer, dict) else answer
-        if isinstance(selected_ids, str):
-            selected_ids = [item.strip() for item in selected_ids.split(",") if item.strip()]
-        selected = repository.validate_selection(
-            runtime.context.user_id,
-            [item["id"] for item in state["candidates"]],
-            selected_ids,
-        )
-        return {"selected_ids": selected}
-
-    def existing_route(state: SearchState) -> str:
-        if not state.get("selected_ids"):
-            return "none"
-        existing_ids = set(state.get("authorized_meeting_ids", []))
-        if not existing_ids:
-            return "new"
-        if set(state["selected_ids"]).issubset(existing_ids):
-            return "unchanged"
-        return "existing"
-
-    def set_new_ids(state: SearchState) -> dict[str, Any]:
-        return {"authorized_meeting_ids": state["selected_ids"], "merge_mode": "set"}
-
-    def keep_existing_ids(state: SearchState) -> dict[str, Any]:
-        """A repeated search for an already-authorized ID needs no HITL."""
-
-        return {"merge_mode": "unchanged"}
-
-    def hitl_merge(state: SearchState) -> dict[str, Any]:
-        answer = interrupt(
-            {
-                "kind": "id_merge",
-                "message": "기존 허용 ID 목록에 새 ID를 추가할지, 새 목록으로 대체할지 선택하세요.",
-                "existing_ids": state.get("authorized_meeting_ids", []),
-                "new_ids": state["selected_ids"],
-                "choices": ["add", "replace"],
-            }
-        )
-        mode = answer.get("mode") if isinstance(answer, dict) else str(answer)
-        if mode not in {"add", "replace"}:
-            raise ValueError("mode는 add 또는 replace여야 합니다.")
-        ids = (
-            list(dict.fromkeys(state.get("authorized_meeting_ids", []) + state["selected_ids"]))
-            if mode == "add"
-            else state["selected_ids"]
-        )
-        return {"authorized_meeting_ids": ids, "merge_mode": mode}
+        prompt = {
+            "kind": "meeting_selection",
+            "message": "접근 가능한 후보가 여러 개입니다. 하나 이상의 meeting_id를 선택하세요.",
+            "candidates": state["candidates"],
+        }
+        while True:
+            answer = interrupt(prompt)
+            selected_ids = answer.get("meeting_ids", []) if isinstance(answer, dict) else answer
+            if isinstance(selected_ids, str):
+                selected_ids = [item.strip() for item in selected_ids.split(",") if item.strip()]
+            if not isinstance(selected_ids, list) or not all(
+                isinstance(item, str) for item in selected_ids
+            ):
+                prompt = {
+                    **prompt,
+                    "error": "검색 후보 중 하나 이상의 meeting_id를 다시 선택하세요.",
+                }
+                continue
+            try:
+                selected = repository.validate_selection(
+                    runtime.context.user_id,
+                    [item["id"] for item in state["candidates"]],
+                    selected_ids,
+                )
+                return {
+                    "selected_ids": selected,
+                    **merge_selected_ids({**state, "selected_ids": selected}),
+                }
+            except ValueError:
+                prompt = {
+                    **prompt,
+                    "error": "검색 후보 중 하나 이상의 meeting_id를 다시 선택하세요.",
+                }
+            except Exception:
+                return {
+                    "selected_ids": [],
+                    "merge_mode": "",
+                    "tool_status": "failed",
+                    "tool_error": {
+                        "code": "SELECTION_VALIDATION_FAILED",
+                        "message": "선택한 회의록을 다시 검증하지 못했습니다.",
+                        "attempts": 1,
+                        "retryable": False,
+                    },
+                }
 
     def search_response(
         state: SearchState, runtime: Runtime[AgentContext]
@@ -177,56 +308,49 @@ def build_search_subgraph(repository: MeetingRepository, model: MeetingModel):
         mode = state.get("merge_mode") or "set"
         result: dict[str, Any] = {
             "status": "failed" if failed else "ok" if selected else "no_candidates",
-            "selected_ids": state.get("selected_ids", []),
-            "authorized_meeting_ids": state.get("authorized_meeting_ids", []),
+            "selected_count": len(selected),
+            "selected_titles": [item["title"] for item in selected],
             "mode": mode if selected else "unchanged",
         }
         if failed:
             result["error"] = state.get("tool_error", {})
         response = model.search_response(
-            runtime.context.request, selected, mode, result
+            runtime.context.request,
+            [{"title": item["title"]} for item in selected],
+            mode,
+            result,
+            state.get("ScratchPad", []),
         )
         return {
             "ScratchPad": [
-                _event("search_response", response=response, **result)
+                _event(
+                    "search_response",
+                    response=response["response"],
+                    follow_up=response["follow_up"],
+                    **result,
+                )
             ]
         }
 
-    builder.add_node("S1_tool_1_search", tool_1_search)
+    builder.add_node("S1_candidate_search_and_judgment", search_and_judge_candidates)
     builder.add_node("S2A_no_candidates", no_candidates)
-    builder.add_node("S2B_auto_select", auto_select)
-    builder.add_node("S2C_hitl_select", hitl_select)
-    builder.add_node("S2_tool_failed", tool_failed)
-    builder.add_node("S2_set_new_ids", set_new_ids)
-    builder.add_node("S2_keep_existing_ids", keep_existing_ids)
-    builder.add_node("S2_hitl_add_or_replace", hitl_merge)
+    builder.add_node("S2B_one_candidate", one_candidate)
+    builder.add_node("S2C_multiple_candidates", multiple_candidates)
     builder.add_node("S3_search_response_ready", search_response)
-    builder.add_edge(START, "S1_tool_1_search")
+    builder.add_edge(START, "S1_candidate_search_and_judgment")
     builder.add_conditional_edges(
-        "S1_tool_1_search",
+        "S1_candidate_search_and_judgment",
         candidate_route,
         {
             "none": "S2A_no_candidates",
-            "one": "S2B_auto_select",
-            "many": "S2C_hitl_select",
-            "failed": "S2_tool_failed",
+            "one": "S2B_one_candidate",
+            "many": "S2C_multiple_candidates",
+            "failed": "S3_search_response_ready",
         },
     )
     builder.add_edge("S2A_no_candidates", "S3_search_response_ready")
-    builder.add_edge("S2_tool_failed", "S3_search_response_ready")
-    builder.add_conditional_edges(
-        "S2B_auto_select",
-        existing_route,
-        {"none": "S3_search_response_ready", "new": "S2_set_new_ids", "unchanged": "S2_keep_existing_ids", "existing": "S2_hitl_add_or_replace"},
-    )
-    builder.add_conditional_edges(
-        "S2C_hitl_select",
-        existing_route,
-        {"none": "S3_search_response_ready", "new": "S2_set_new_ids", "unchanged": "S2_keep_existing_ids", "existing": "S2_hitl_add_or_replace"},
-    )
-    builder.add_edge("S2_set_new_ids", "S3_search_response_ready")
-    builder.add_edge("S2_keep_existing_ids", "S3_search_response_ready")
-    builder.add_edge("S2_hitl_add_or_replace", "S3_search_response_ready")
+    builder.add_edge("S2B_one_candidate", "S3_search_response_ready")
+    builder.add_edge("S2C_multiple_candidates", "S3_search_response_ready")
     builder.add_edge("S3_search_response_ready", END)
     return builder.compile()
 
@@ -234,7 +358,7 @@ def build_search_subgraph(repository: MeetingRepository, model: MeetingModel):
 def build_question_subgraph(repository: MeetingRepository, model: MeetingModel):
     builder = StateGraph(QuestionState, context_schema=AgentContext)
 
-    def tool_2_context_and_answer(
+    def tool_2_source_lookup(
         state: QuestionState, runtime: Runtime[AgentContext]
     ) -> dict[str, Any]:
         ids = state.get("authorized_meeting_ids", [])
@@ -243,66 +367,95 @@ def build_question_subgraph(repository: MeetingRepository, model: MeetingModel):
             result: dict[str, Any] = {"status": "selection_required"}
         else:
             loaded, error = _call_with_retry(
-                lambda: repository.get_meeting_documents(runtime.context.user_id, ids)
+                lambda: repository.get_meeting_documents(runtime.context.user_id, ids),
+                permission_error_code="UNAUTHORIZED_MEETING_ID",
             )
             if error:
                 result = {
                     "status": "source_denied_or_failed",
-                    "reason": error["message"],
-                    "error": error,
+                    "reason": "권한 검증 또는 회의록 원문 조회에 실패했습니다.",
+                    "error": {
+                        key: error[key]
+                        for key in ("code", "attempts", "retryable")
+                    },
                 }
             else:
                 documents = loaded or []
                 result = {
                     "status": "source_ready",
                     "documents": [
-                        {"id": doc["id"], "title": doc["title"]} for doc in documents
+                        {"title": doc["title"]} for doc in documents
                     ],
                 }
 
-        response = model.answer_question(
-            SYSTEM_INSTRUCTION,
-            runtime.context.request,
-            state.get("ScratchPad", []),
-            documents,
-            result,
-        )
         return {
             "tool_status": result["status"],
             "last_result": result,
-            "ScratchPad": [
-                _event(
-                    "question_response",
-                    response=response,
-                    status=result["status"],
-                    document_metadata=result.get("documents", []),
-                    error=result.get("error"),
-                )
-            ],
+            "documents": documents,
         }
 
     def result_route(state: QuestionState) -> str:
         return state["tool_status"]
 
-    builder.add_node("Q1_tool_2_context_and_answer", tool_2_context_and_answer)
-    builder.add_node("Q2A_selection_required", lambda state: {})
-    builder.add_node("Q2B_source_ready", lambda state: {})
-    builder.add_node("Q2C_source_denied_or_failed", lambda state: {})
-    builder.add_node("Q3_question_response_ready", lambda state: {})
-    builder.add_edge(START, "Q1_tool_2_context_and_answer")
+    def build_context(state: QuestionState) -> dict[str, Any]:
+        return {
+            "model_context": {
+                "documents": state.get("documents", []),
+                "tool_result": state["last_result"],
+            }
+        }
+
+    def question_response(
+        state: QuestionState, runtime: Runtime[AgentContext]
+    ) -> dict[str, Any]:
+        context = state["model_context"]
+        response = model.answer_question(
+            SYSTEM_INSTRUCTION,
+            runtime.context.request,
+            state.get("ScratchPad", []),
+            [
+                {key: value for key, value in document.items() if key != "id"}
+                for document in context["documents"]
+            ],
+            context["tool_result"],
+        )
+        response = _without_full_sources(response, context["documents"])
+        result = context["tool_result"]
+        return {
+            "ScratchPad": [
+                _event(
+                    "question_response",
+                    response=response["response"],
+                    follow_up=response["follow_up"],
+                    status=result["status"],
+                    document_count=len(result.get("documents", [])),
+                    document_titles=[
+                        document["title"] for document in result.get("documents", [])
+                    ],
+                    error=result.get("error"),
+                )
+            ]
+        }
+
+    builder.add_node("Q1_tool_2_source_lookup", tool_2_source_lookup)
+    builder.add_node("Q2A_build_selection_context", build_context)
+    builder.add_node("Q2B_build_source_context", build_context)
+    builder.add_node("Q2C_build_failure_context", build_context)
+    builder.add_node("Q3_question_response", question_response)
+    builder.add_edge(START, "Q1_tool_2_source_lookup")
     builder.add_conditional_edges(
-        "Q1_tool_2_context_and_answer",
+        "Q1_tool_2_source_lookup",
         result_route,
         {
-            "selection_required": "Q2A_selection_required",
-            "source_ready": "Q2B_source_ready",
-            "source_denied_or_failed": "Q2C_source_denied_or_failed",
+            "selection_required": "Q2A_build_selection_context",
+            "source_ready": "Q2B_build_source_context",
+            "source_denied_or_failed": "Q2C_build_failure_context",
         },
     )
-    builder.add_edge("Q2A_selection_required", "Q3_question_response_ready")
-    builder.add_edge("Q2B_source_ready", "Q3_question_response_ready")
-    builder.add_edge("Q2C_source_denied_or_failed", "Q3_question_response_ready")
-    builder.add_edge("Q3_question_response_ready", END)
+    builder.add_edge("Q2A_build_selection_context", "Q3_question_response")
+    builder.add_edge("Q2B_build_source_context", "Q3_question_response")
+    builder.add_edge("Q2C_build_failure_context", "Q3_question_response")
+    builder.add_edge("Q3_question_response", END)
     return builder.compile()
 
 
@@ -321,14 +474,7 @@ def build_agent_graph(repository: MeetingRepository, model: MeetingModel):
         size = len(json.dumps(events, ensure_ascii=False, default=str))
         if size < MODEL_CONTEXT_BUDGET_CHARS // 2:
             return {}
-        current_goal = _current_goal_events(state)
-        old_events = events[: len(events) - len(current_goal)]
-        summary = _event(
-            "compact_summary",
-            compacted_event_count=len(old_events),
-            event_kinds=dict(Counter(item.get("kind", "unknown") for item in old_events)),
-        )
-        return {"ScratchPad": {"__replace__": [summary, *current_goal]}}
+        return {"ScratchPad": {"__replace__": compact_scratchpad_events(events)}}
 
     def decide(
         state: AgentState, runtime: Runtime[AgentContext]
@@ -337,23 +483,21 @@ def build_agent_graph(repository: MeetingRepository, model: MeetingModel):
             "search_subgraph",
             "question_subgraph",
             "llm_direct_answer",
-            "request_finished",
         ]
     ]:
-        action = model.decide_next_action(
+        decision = model.decide_next_action(
             runtime.context.request,
             _current_goal_events(state),
-            state.get("authorized_meeting_ids", []),
         )
+        action = decision["action"]
         destinations = {
             "search": "search_subgraph",
             "question": "question_subgraph",
             "direct": "llm_direct_answer",
-            "none": "request_finished",
         }
         return Command(
             goto=destinations[action],
-            update={"ScratchPad": [_event("llm_decision", action=action)]},
+            update={"ScratchPad": [_event("llm_decision", **decision)]},
         )
 
     def direct_answer(
@@ -364,19 +508,23 @@ def build_agent_graph(repository: MeetingRepository, model: MeetingModel):
             runtime.context.request,
             state.get("ScratchPad", []),
         )
-        return {"ScratchPad": [_event("direct_response", response=response, status="direct")]}
+        return {
+            "ScratchPad": [
+                _event(
+                    "direct_response",
+                    response=response["response"],
+                    follow_up=response["follow_up"],
+                    status="direct",
+                )
+            ]
+        }
 
-    def business_checkpoint(state: AgentState) -> dict[str, Any]:
-        latest = _current_goal_events(state)
-        status = next(
-            (
-                event.get("status", "ok")
-                for event in reversed(latest)
-                if event.get("kind") in {"search_response", "question_response", "direct_response"}
-            ),
-            "unknown",
+    def follow_up_route(state: AgentState) -> str:
+        event = next(
+            item for item in reversed(_current_goal_events(state))
+            if item.get("kind") in {"search_response", "question_response"}
         )
-        return {"ScratchPad": [_event("business_checkpoint", result_status=status)]}
+        return "continue" if event.get("follow_up") is True else "finish"
 
     builder.add_node("receive_user_request", receive_request)
     builder.add_node("compact_scratchpad", compact_scratchpad)
@@ -384,14 +532,18 @@ def build_agent_graph(repository: MeetingRepository, model: MeetingModel):
     builder.add_node("search_subgraph", search_graph)
     builder.add_node("question_subgraph", question_graph)
     builder.add_node("llm_direct_answer", direct_answer)
-    builder.add_node("graph_runtime_checkpoint", business_checkpoint)
-    builder.add_node("request_finished", lambda state: {})
     builder.add_edge(START, "receive_user_request")
     builder.add_edge("receive_user_request", "compact_scratchpad")
     builder.add_edge("compact_scratchpad", "llm_goal_condition")
-    builder.add_edge("search_subgraph", "graph_runtime_checkpoint")
-    builder.add_edge("question_subgraph", "graph_runtime_checkpoint")
-    builder.add_edge("llm_direct_answer", "graph_runtime_checkpoint")
-    builder.add_edge("graph_runtime_checkpoint", "compact_scratchpad")
-    builder.add_edge("request_finished", END)
+    builder.add_conditional_edges(
+        "search_subgraph",
+        follow_up_route,
+        {"continue": "compact_scratchpad", "finish": END},
+    )
+    builder.add_conditional_edges(
+        "question_subgraph",
+        follow_up_route,
+        {"continue": "compact_scratchpad", "finish": END},
+    )
+    builder.add_edge("llm_direct_answer", END)
     return builder

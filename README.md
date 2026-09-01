@@ -22,7 +22,7 @@
 - Context 예산 50%에서 `ScratchPad` Compact
 - 실제 `deepseek-v4-pro` 모델 호출
 
-CLI의 기본 모델은 실제 DeepSeek API를 호출하는 `DeepSeekMeetingModel`입니다. `RuleBasedMeetingModel`은 빠르고 재현 가능한 오프라인 테스트 대역으로 유지합니다. API 키는 코드나 State에 저장하지 않고 실행 시 키 파일에서만 읽습니다.
+CLI의 기본 모델은 실제 DeepSeek API를 호출하는 `DeepSeekMeetingModel`입니다. Graph의 짧은 구조화 JSON 계약에는 `deepseek-v4-pro`의 Thinking을 비활성화해 불필요한 추론 지연과 출력 한도 소진을 막습니다. `RuleBasedMeetingModel`은 빠르고 재현 가능한 오프라인 테스트 대역으로 유지합니다. API 키는 코드나 State에 저장하지 않고 실행 시 키 파일에서만 읽습니다.
 
 ## 설계 대응
 
@@ -36,15 +36,16 @@ CLI의 기본 모델은 실제 DeepSeek API를 호출하는 `DeepSeekMeetingMode
 회의록 검색·질문
 → agent_graph.py의 최상위 StateGraph
 → Search·Question Subgraph
-→ graph_runtime_checkpoint
-→ llm_goal_condition
-   ├─ 후속 작업 있음: 다음 Subgraph
-   └─ 후속 작업 없음: END
+→ LLM이 응답 + follow_up 반환
+→ Graph Runtime이 State 반영·Checkpoint 저장
+→ 고정 Condition
+   ├─ follow_up=true: llm_goal_condition 재진입
+   └─ follow_up=false: END
 ```
 
 `search`와 `question`은 별도 영속 변수로 저장하지 않습니다. 실행 중인 Subgraph Node와 Edge가 개념적 Graph State를 나타냅니다.
 
-`user_id`, `thread_id`, 현재 `request`는 `AgentContext`로 전달되며 Checkpoint에 저장되지 않습니다. 회의록 원문도 Question Node의 지역 변수에만 존재하며 State에는 답변과 문서 메타데이터만 남습니다.
+`user_id`, `thread_id`, 현재 `request`는 `AgentContext`로 전달되며 Checkpoint에 저장되지 않습니다. Checkpoint·Lock·HITL Context는 `(user_id, thread_id)`로 격리합니다. 회의록 원문은 LangGraph의 비추적 메모리 채널에서 현재 Question 실행 동안만 전달되며 State Snapshot에는 답변과 문서 메타데이터만 남습니다.
 
 ## 파일별 역할
 
@@ -53,10 +54,12 @@ CLI의 기본 모델은 실제 DeepSeek API를 호출하는 `DeepSeekMeetingMode
 | `src/meeting_agent/state.py` | Agent State, Subgraph State, Runtime Context |
 | `src/meeting_agent/agent_graph.py` | 최상위 Agent Graph와 Search·Question Subgraph |
 | `src/meeting_agent/recording_graph.py` | LLM 없는 결정적 녹화 Workflow |
-| `src/meeting_agent/runtime.py` | Graph 조립, Checkpoint, Lock, HITL 재개 |
+| `src/meeting_agent/runtime.py` | Graph 조립, Checkpoint, Lock, HITL 재개와 실시간 Trace iterator |
 | `src/meeting_agent/model.py` | 실제 DeepSeek Adapter와 테스트 Model 계약 |
 | `src/meeting_agent/repository.py` | 권한·검색·원문·녹화 백엔드의 SQLite 대역 |
 | `src/meeting_agent/cli.py` | 실제 UI 대신 사용하는 로컬 실행 진입점 |
+| `src/meeting_agent/tracing.py` | debug event 단위 안전한 Trace 변환 |
+| `src/meeting_agent/web_demo.py` | 표준 라이브러리 SSE 서버와 실시간 Trace UI |
 
 ## 설치
 
@@ -113,7 +116,7 @@ $env:DEEPSEEK_MODEL="deepseek-v4-pro"
 
 ## 발표용 로컬 Trace 서버
 
-브라우저에서 실제 LangGraph 실행의 Graph, Subgraph, Node, Edge와 State Snapshot을 순서대로 확인할 수 있습니다.
+브라우저에서 실제 LangGraph 실행의 Graph, Subgraph, Node, Edge와 State Snapshot을 이벤트 발생 즉시 확인할 수 있습니다.
 
 ```powershell
 .\.venv\Scripts\python.exe -m meeting_agent `
@@ -133,9 +136,9 @@ meeting-001 회의록을 가져오고 결정 사항을 설명해줘
 /meeting-stop
 ```
 
-복수 후보 HITL은 `회의록 검색해줘`로 발생시키고, 화면에 나온 후보를 `/select meeting-001`처럼 입력해 재개합니다. 기존 허용 ID가 있을 때 추가·대체 질문이 나오면 `/merge add` 또는 `/merge replace`를 입력합니다.
+복수 후보 HITL은 `회의록 검색해줘`로 발생시키고, 화면에 나온 후보를 `/select meeting-001`처럼 입력해 재개합니다. 기존 허용 ID가 있을 때 추가·대체 질문이 나오면 `/merge add` 또는 `/merge replace`를 입력합니다. 후보 밖 ID나 잘못된 추가·대체 값은 같은 HITL 질문으로 다시 확인하며, HITL 대기 중 일반 요청을 입력해도 새 실행을 시작하지 않고 기존 질문을 유지합니다.
 
-Trace는 LangGraph의 실제 debug stream에서 생성합니다. 회의록 원문과 API 키는 화면 로그에 노출하지 않습니다.
+Trace는 Agent Graph와 Recording Workflow의 실제 LangGraph debug stream을 SSE로 즉시 전달합니다. 녹화 Node가 완료된 뒤 `recording_modal_status`가 Agent Checkpoint에 실제로 반영된 시점도 별도 업무 경계로 표시합니다. 실행 완료 후 재생하는 인위적 애니메이션이 아니며, 회의록 원문·API 키·내부 예외 문자열은 화면 로그에 노출하지 않습니다.
 
 ## 실제 구현과 대역
 

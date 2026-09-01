@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
 
 
 STATE_KEYS = {
@@ -50,20 +50,18 @@ def safe_state(values: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def debug_stream_to_trace(
-    chunks: Iterable[tuple[tuple[str, ...], dict[str, Any]]]
+def debug_event_to_trace(
+    namespace: tuple[str, ...], event: dict[str, Any], root_graph: str = "Agent Graph"
 ) -> list[dict[str, Any]]:
-    trace: list[dict[str, Any]] = []
-    for namespace, event in chunks:
-        event_type = event.get("type")
-        payload = event.get("payload", {})
-        graph = graph_name(namespace)
-        if event_type == "task":
-            node = payload.get("name", "unknown")
-            if node == "__start__":
-                continue
-            triggers = [str(item) for item in payload.get("triggers", ())]
-            trace.append(
+    event_type = event.get("type")
+    payload = event.get("payload", {})
+    graph = graph_name(namespace) if namespace else root_graph
+    if event_type == "task":
+        node = payload.get("name", "unknown")
+        if node == "__start__":
+            return []
+        triggers = [str(item) for item in payload.get("triggers", ())]
+        return [
                 {
                     "type": "node",
                     "phase": "start",
@@ -72,34 +70,40 @@ def debug_stream_to_trace(
                     "step": event.get("step"),
                     "edge": triggers[0] if triggers else "",
                 }
-            )
-        elif event_type == "task_result":
-            node = payload.get("name", "unknown")
-            if node == "__start__":
-                continue
-            result = payload.get("result")
-            decision = None
-            if node == "llm_goal_condition" and isinstance(result, dict):
-                for item in result.get("ScratchPad", []):
-                    if item.get("kind") == "llm_decision":
-                        decision = item.get("action")
-            trace.append(
+            ]
+    if event_type == "task_result":
+        node = payload.get("name", "unknown")
+        if node == "__start__":
+            return []
+        result = payload.get("result")
+        decision = None
+        if node == "llm_goal_condition" and isinstance(result, dict):
+            for item in result.get("ScratchPad", []):
+                if item.get("kind") == "llm_decision":
+                    decision = item.get("action")
+        return [
                 {
                     "type": "node",
                     "phase": "end",
                     "graph": graph,
                     "node": node,
                     "step": event.get("step"),
+                    "edge": (
+                        "→ END"
+                        if root_graph == "Recording Workflow"
+                        and node == "recording_modal_and_backend"
+                        else ""
+                    ),
                     "output": safe_state(result) if isinstance(result, dict) else safe_value(result),
                     "decision": decision,
-                    "error": safe_value(payload.get("error")),
+                    "error": "Graph 실행 오류" if payload.get("error") else None,
                     "interrupts": safe_value(payload.get("interrupts", [])),
                 }
-            )
-        elif event_type == "checkpoint" and event.get("step", -1) >= 0:
-            values = payload.get("values", {})
-            next_nodes = list(payload.get("next", []))
-            trace.append(
+            ]
+    if event_type == "checkpoint" and event.get("step", -1) >= 0:
+        values = payload.get("values", {})
+        next_nodes = list(payload.get("next", []))
+        return [
                 {
                     "type": "state",
                     "graph": graph,
@@ -108,5 +112,5 @@ def debug_stream_to_trace(
                     "edge": f"→ {', '.join(next_nodes)}" if next_nodes else "→ END",
                     "state": safe_state(values) if isinstance(values, dict) else {},
                 }
-            )
-    return trace
+            ]
+    return []

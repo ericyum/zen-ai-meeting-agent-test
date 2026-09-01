@@ -36,19 +36,44 @@ class RecordingWorkflowTest(unittest.TestCase):
         self.assertIn("실행할 수 없습니다", rejected["response"])
 
     def test_modal_execution_error_is_persisted_only_as_agent_status(self):
+        secret = "SECRET_MODAL_CONNECTION_DETAIL"
+
         def fail_modal(user_id, thread_id, command):
-            raise ConnectionError("modal disconnected")
+            raise ConnectionError(secret)
 
         self.runtime.repository.execute_recording_command = fail_modal
         result = self.runtime.run_recording("user-eric", "thread-error", "start")
         self.assertEqual(result["recording_modal_status"], "error")
-        self.assertEqual(self.runtime.repository.get_modal_status("thread-error"), "error")
-        state = self.runtime.get_agent_state("thread-error")
+        self.assertEqual(
+            self.runtime.repository.get_modal_status(
+                '["recording-modal","user-eric","thread-error"]'
+            ),
+            "error",
+        )
+        state = self.runtime.get_agent_state("user-eric", "thread-error")
         self.assertEqual(
             set(state), {"ScratchPad", "authorized_meeting_ids", "recording_modal_status"}
         )
         self.assertEqual(state["recording_modal_status"], "error")
         self.assertNotIn("recording_state", state)
+        self.assertNotIn(secret, result["response"])
+
+    def test_modal_error_handler_hides_secondary_repository_failure(self):
+        secret = "SECONDARY_REPOSITORY_SECRET"
+
+        def fail_repository(*args, **kwargs):
+            raise ConnectionError(secret)
+
+        self.runtime.repository.execute_recording_command = fail_repository
+        self.runtime.repository.set_modal_status = fail_repository
+        self.runtime.repository.get_recording_state = fail_repository
+
+        result = self.runtime.run_recording(
+            "user-eric", "thread-secondary-error", "start"
+        )
+
+        self.assertEqual(result["recording_modal_status"], "error")
+        self.assertNotIn(secret, str(result))
 
 
 if __name__ == "__main__":

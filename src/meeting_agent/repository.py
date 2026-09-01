@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+from .model import SearchQuery
 
 
 @dataclass(frozen=True)
@@ -152,25 +153,17 @@ class MeetingRepository:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def search_meetings(self, user_id: str, request: str) -> list[dict[str, Any]]:
+    def search_meetings(self, user_id: str, query: SearchQuery) -> list[dict[str, Any]]:
         accessible = self.list_accessible_meetings(user_id)
-        explicit_ids = set(re.findall(r"meeting-\d{3}", request.lower()))
+        explicit_ids = {item.lower() for item in query["meeting_ids"]}
         if explicit_ids:
             return [item for item in accessible if item["id"].lower() in explicit_ids]
 
-        dates = set(re.findall(r"20\d{2}-\d{2}-\d{2}", request))
-        if dates:
-            accessible = [item for item in accessible if item["meeting_date"] in dates]
+        meeting_date = query["meeting_date"]
+        if meeting_date:
+            accessible = [item for item in accessible if item["meeting_date"] == meeting_date]
 
-        stop_words = {
-            "회의록", "회의", "관련", "검색", "검색해줘", "선택", "찾아줘", "가져와줘", "가져오고",
-            "내용", "질문", "설명", "알려줘", "해줘", "대한", "대해", "그리고", "있는",
-        }
-        tokens = [
-            token.lower()
-            for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", request)
-            if token.lower() not in stop_words and not token.startswith("meeting-")
-        ]
+        tokens = [token.lower() for token in query["keywords"]]
         if not tokens:
             return accessible
 
@@ -207,7 +200,7 @@ class MeetingRepository:
         placeholders = ",".join("?" for _ in ids)
         rows = self.conn.execute(
             f"""
-            SELECT m.id, m.title, m.meeting_date, m.transcript
+            SELECT m.id, m.title, m.meeting_date, m.summary, m.transcript
             FROM meetings m
             JOIN meeting_access a ON a.meeting_id = m.id
             WHERE a.user_id = ? AND m.id IN ({placeholders})
